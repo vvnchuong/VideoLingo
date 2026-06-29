@@ -64,7 +64,7 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
     WHISPER_LANGUAGE = load_key("whisper.language")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rprint(f"🚀 Starting WhisperX using device: {device} ...")
-    
+
     if device == "cuda":
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         batch_size = 16 if gpu_mem > 8 else 2
@@ -75,14 +75,10 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
         compute_type = "int8"
         rprint(f"[cyan]📦 Batch size:[/cyan] {batch_size}, [cyan]⚙️ Compute type:[/cyan] {compute_type}")
     rprint(f"[green]▶️ Starting WhisperX for segment {start:.2f}s to {end:.2f}s...[/green]")
-    
-    if WHISPER_LANGUAGE == 'zh':
-        model_name = "Huan69/Belle-whisper-large-v3-zh-punct-fasterwhisper"
-        local_model = os.path.join(MODEL_DIR, "Belle-whisper-large-v3-zh-punct-fasterwhisper")
-    else:
-        model_name = load_key("whisper.model")
-        local_model = os.path.join(MODEL_DIR, model_name)
-        
+
+    model_name = load_key("whisper.model")
+    local_model = os.path.join(MODEL_DIR, model_name)
+
     if os.path.exists(local_model):
         rprint(f"[green]📥 Loading local WHISPER model:[/green] {local_model} ...")
         model_name = local_model
@@ -105,7 +101,7 @@ def transcribe_audio(raw_audio_file, vocal_audio_file, start, end):
 
     raw_audio_segment = load_audio_segment(raw_audio_file, start, end)
     vocal_audio_segment = load_audio_segment(vocal_audio_file, start, end)
-    
+
     # -------------------------
     # 1. transcribe raw audio
     # -------------------------

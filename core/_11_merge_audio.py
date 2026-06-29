@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import subprocess
 from pydub import AudioSegment
@@ -18,7 +19,7 @@ def load_and_flatten_data(excel_file):
     df = pd.read_excel(excel_file)
     lines = [eval(line) if isinstance(line, str) else line for line in df['lines'].tolist()]
     lines = [item for sublist in lines for item in sublist]
-    
+
     new_sub_times = [eval(time) if isinstance(time, str) else time for time in df['new_sub_times'].tolist()]
     new_sub_times = [item for sublist in new_sub_times for item in sublist]
     

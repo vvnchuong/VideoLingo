@@ -56,7 +56,10 @@ def merge_video_audio():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
-    
+
+    if load_key("whisper.language") == "zh":
+        DUB_SUB_FILE = 'output/audio/trans_subs_for_audio.srt'
+
     subtitle_filter = (
         f"subtitles={DUB_SUB_FILE}:force_style='FontSize={TRANS_FONT_SIZE},"
         f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"

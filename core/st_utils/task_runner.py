@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -143,3 +144,4 @@ class TaskRunner:
         except Exception as e:
             self.error_msg = str(e)
             self.state = "error"
+            traceback.print_exc()

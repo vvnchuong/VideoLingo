@@ -1,5 +1,16 @@
-import streamlit as st
 import os, sys, time
+
+
+def _configure_utf8_console():
+    """Allow Rich and task threads to print Unicode on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_console()
+
+import streamlit as st
 from core.st_utils.imports_and_utils import *
 from core.st_utils.task_runner import TaskRunner
 from core import *
@@ -94,6 +105,26 @@ def _task_control_panel(runner_key: str):
 
 def _get_text_steps():
     """Return the subtitle processing steps as (label, callable) list."""
+    # ── ZH source: bypass WhisperX alignment + NLP split + 2-step LLM translate ──
+    # Those steps are unreliable for Chinese (wav2vec2-zh alignment fails, spaCy zh
+    # sentence splitting is poor for speech). We use VAD + faster-whisper clip +
+    # Gemini duration-aware translation instead, which writes the same intermediate
+    # files Lingo expects so all downstream steps (_7, _8, _10…_12) run unchanged.
+    try:
+        _lang = load_key("whisper.language")
+    except Exception:
+        _lang = "en"
+
+    if _lang == "zh":
+        from core.zh_pipeline import zh_asr_and_translate
+        return [
+            (t("ZH: VAD + Whisper clip + Gemini duration-aware translate"),
+             zh_asr_and_translate),
+            (t("Merging subtitles into the video"),
+             _7_sub_into_vid.merge_subtitles_to_video),
+        ]
+
+    # ── Default EN (and other languages) — original Lingo flow ──
     steps = [
         (t("WhisperX word-level transcription"), _2_asr.transcribe),
         (
@@ -170,6 +201,29 @@ def text_processing_section():
 
 def _get_audio_steps():
     """Return the audio/dubbing processing steps as (label, callable) list."""
+    # ── ZH: swap _8_1 audio task writer for ZH-aware version ──
+    try:
+        _lang = load_key("whisper.language")
+    except Exception:
+        _lang = "en"
+
+    if _lang == "zh":
+        from core.zh_pipeline import zh_gen_audio_tasks
+        return [
+            (
+                t("Generate audio tasks and chunks"),
+                lambda: (
+                    zh_gen_audio_tasks(),
+                    _8_2_dub_chunks.gen_dub_chunks(),
+                ),
+            ),
+            (t("Extract reference audio"), _9_refer_audio.extract_refer_audio_main),
+            (t("Generate and merge audio files"), _10_gen_audio.gen_audio),
+            (t("Merge full audio"), _11_merge_audio.merge_full_audio),
+            (t("Merge final audio into video"), _12_dub_to_vid.merge_video_audio),
+        ]
+
+    # ── Default EN flow ──
     steps = [
         (
             t("Generate audio tasks and chunks"),
