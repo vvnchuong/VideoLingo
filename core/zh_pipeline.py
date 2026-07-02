@@ -4,6 +4,7 @@ zh_pipeline.py — Chinese (ZH) pipeline adapter for VideoLingo
 
 import os, re, gc, json, time, asyncio, tempfile, shutil, sys, subprocess, datetime, warnings
 import torch, srt, pandas as pd
+import cv2
 from datetime import timedelta
 from rich import print as rprint
 from google import genai as google_genai
@@ -12,7 +13,7 @@ from deep_translator import GoogleTranslator
 from faster_whisper import WhisperModel
 from core.utils import load_key, update_key
 from core.utils.models import (
-    _2_CLEANED_CHUNKS, _4_2_TRANSLATION, _5_SPLIT_SUB, _5_REMERGED,
+    _2_CLEANED_CHUNKS,
     _8_1_AUDIO_TASK, _OUTPUT_DIR, _AUDIO_DIR, _RAW_AUDIO_FILE,
 )
 
@@ -20,10 +21,24 @@ SRC_SRT_PATH    = os.path.join(_OUTPUT_DIR, "src.srt")
 TRANS_SRT_PATH  = os.path.join(_OUTPUT_DIR, "trans.srt")
 TRANS_AUDIO_SRT = os.path.join(_AUDIO_DIR, "trans_subs_for_audio.srt")
 SRC_AUDIO_SRT   = os.path.join(_AUDIO_DIR, "src_subs_for_audio.srt")
+# File riêng của ZH pipeline: bảng 1 câu = 1 dòng, khớp 1:1 zh/vi.
+# KHÔNG dùng translation_results.xlsx (_4_2_TRANSLATION) vì đó là file của pipeline EN/other,
+# không liên quan tới ZH, tuyệt đối không đụng vào.
+ZH_SYNC_JSON = os.path.join(_OUTPUT_DIR, "log", "zh_sync.json")
 
 def _cfg(key, fallback=None):
     try: return load_key(key)
     except Exception: return fallback
+
+def _is_portrait_video(video_path):
+    try:
+        cap = cv2.VideoCapture(video_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return h > w
+    except Exception:
+        return False
 
 VAD_THRESHOLD      = 0.35
 VAD_MIN_SILENCE_MS = 300
@@ -74,9 +89,7 @@ def _get_paths(session_id=None):
         "audio_dir":       _AUDIO_DIR,
         "raw_audio":       _RAW_AUDIO_FILE,
         "cleaned_chunks":  _2_CLEANED_CHUNKS,
-        "translation":     _4_2_TRANSLATION,
-        "split_sub":       _5_SPLIT_SUB,
-        "remerged":        _5_REMERGED,
+        "zh_sync":         ZH_SYNC_JSON,
         "audio_task":      _8_1_AUDIO_TASK,
         "src_srt":         SRC_SRT_PATH,
         "trans_srt":       TRANS_SRT_PATH,
@@ -358,7 +371,7 @@ def _gemini_single(zh_text, duration_s, client, retries=1):
         time.sleep(1.0)
     return ""
 
-def gemini_translate(data, client):
+def gemini_translate(data, client, is_portrait=False):
     rprint(f"[cyan]📝 Gemini dịch {len(data)} câu (batch={TRANSLATE_BATCH})...[/cyan]")
     all_vi,all_syl,prev_tail={},{},[]
     for bstart in range(0,len(data),TRANSLATE_BATCH):
@@ -408,14 +421,16 @@ def _write_cleaned_chunks(data):
     df.to_excel(_2_CLEANED_CHUNKS,index=False)
     rprint(f"[green]✅ cleaned_chunks.xlsx → {_2_CLEANED_CHUNKS} ({len(rows)} rows)[/green]")
 
-def _write_translation_results(data):
-    rows=[{"Source":d["zh"],"Translation":d["vi"],"start_time":_srt_time_dot(d["start"]),
-           "end_time":_srt_time_dot(d["end"]),"duration":round(d["end"]-d["start"],3)} for d in data]
-    df=pd.DataFrame(rows); os.makedirs(os.path.dirname(_4_2_TRANSLATION),exist_ok=True)
-    df.to_excel(_4_2_TRANSLATION,index=False); df.to_excel(_5_SPLIT_SUB,index=False); df.to_excel(_5_REMERGED,index=False)
-    rprint(f"[green]✅ translation_results.xlsx → {_4_2_TRANSLATION} ({len(rows)} rows)[/green]")
+def _write_zh_sync(data):
+    """Bảng 1 câu = 1 dòng, khớp 1:1 zh/vi — nguồn thật để dub. File JSON riêng của ZH,
+    không đụng gì tới translation_results.xlsx (đó là file của pipeline EN/other)."""
+    rows = [{"start": d["start"], "end": d["end"], "zh": d["zh"], "vi": d["vi"]} for d in data]
+    os.makedirs(os.path.dirname(ZH_SYNC_JSON), exist_ok=True)
+    with open(ZH_SYNC_JSON, "w", encoding="utf-8") as f:
+        json.dump(rows, f, ensure_ascii=False, indent=2)
+    rprint(f"[green]✅ zh_sync.json → {ZH_SYNC_JSON} ({len(rows)} rows)[/green]")
 
-def _write_subtitles(data):
+def _write_subtitles(data, is_portrait=False):
     os.makedirs(_OUTPUT_DIR,exist_ok=True); os.makedirs(_AUDIO_DIR,exist_ok=True)
     zh_display,vi_display=[],[]
     for d in data:
@@ -453,9 +468,12 @@ def zh_asr_and_translate(session_id=None):
         if not data: raise RuntimeError("Whisper không transcribe được")
         _unload_whisper()   # giải phóng VRAM trước Gemini
         client=_gemini_client()
+        is_portrait = _is_portrait_video(video_path)
+        if is_portrait:
+            rprint("[bold cyan]📱 Phát hiện video dọc (portrait/short) -> font sub sẽ tự nhỏ hơn khi burn[/bold cyan]")
         data=gemini_translate(data,client)
         if not data: raise RuntimeError("Gemini không dịch được câu nào")
-        _write_cleaned_chunks(data); _write_translation_results(data); _write_subtitles(data)
+        _write_cleaned_chunks(data); _write_zh_sync(data); _write_subtitles(data)
         try: update_key("whisper.detected_language","zh")
         except Exception: pass
         rprint(f"[bold green]✅ ZH ASR+Translate hoàn tất — {len(data)} câu[/bold green]")
@@ -477,14 +495,19 @@ def zh_gen_audio_tasks(session_id=None):
     rprint("[bold magenta]🚀 ZH: Gen audio tasks[/bold magenta]")
     from core.tts_backend.estimate_duration import init_estimator, estimate_duration
     from core.asr_backend.audio_preprocess import get_audio_duration
-    df_trans=pd.read_excel(_4_2_TRANSLATION)
+    # zh_sync.json: bảng 1 dòng = 1 câu, khớp 1:1 zh/vi — nguồn thật để dub.
+    # KHÔNG đọc translation_results.xlsx (file của pipeline EN/other) và KHÔNG đọc
+    # src.srt/trans.srt (bị tách dòng hiển thị burn hình riêng theo từng ngôn ngữ, số dòng lệch nhau).
+    with open(ZH_SYNC_JSON, encoding="utf-8") as f:
+        sync_rows = json.load(f)
     estimator=init_estimator()
     accept=_cfg("speed_factor.accept",1.2); tol_cfg=_cfg("tolerance",1.5)
     min_dur=_cfg("min_subtitle_duration",2.5); whole_dur=get_audio_duration(_RAW_AUDIO_FILE)
     rows=[]
-    for i,row in df_trans.iterrows():
-        rows.append({"number":i+1,"text":row["Translation"],"origin":row["Source"],
-                     "start_time":row["start_time"],"end_time":row["end_time"],"duration":row["duration"]})
+    for i,r in enumerate(sync_rows):
+        rows.append({"number":i+1,"text":r["vi"],"origin":r["zh"],
+                     "start_time":_srt_time_dot(r["start"]),"end_time":_srt_time_dot(r["end"]),
+                     "duration":round(r["end"]-r["start"],3)})
     i=0
     while i<len(rows):
         dur=rows[i]["duration"]

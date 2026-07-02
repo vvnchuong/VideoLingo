@@ -13,6 +13,7 @@ _configure_utf8_console()
 import streamlit as st
 from core.st_utils.imports_and_utils import *
 from core.st_utils.task_runner import TaskRunner
+from core.st_utils.edit_sub_section import edit_sub_section
 from core import *
 
 # SET PATH
@@ -307,6 +308,7 @@ def main():
         st.markdown(give_star_button, unsafe_allow_html=True)
     download_video_section()
     text_processing_section()
+    edit_sub_section()
     audio_processing_section()
 
 

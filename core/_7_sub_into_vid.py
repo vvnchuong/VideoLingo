@@ -25,14 +25,15 @@ SRC_OUTLINE_WIDTH = 1
 SRC_SHADOW_COLOR = '&H80000000'
 TRANS_FONT_COLOR = '&H00FFFF'
 TRANS_OUTLINE_COLOR = '&H000000'
-TRANS_OUTLINE_WIDTH = 1 
+TRANS_OUTLINE_WIDTH = 1
 TRANS_BACK_COLOR = '&H33000000'
 
 OUTPUT_DIR = "output"
 OUTPUT_VIDEO = f"{OUTPUT_DIR}/output_sub.mp4"
 SRC_SRT = f"{OUTPUT_DIR}/src.srt"
 TRANS_SRT = f"{OUTPUT_DIR}/trans.srt"
-    
+
+
 def check_gpu_available():
     try:
         result = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
@@ -40,13 +41,15 @@ def check_gpu_available():
     except:
         return False
 
+
 def merge_subtitles_to_video():
     video_file = find_video_files()
     os.makedirs(os.path.dirname(OUTPUT_VIDEO), exist_ok=True)
 
     # Check resolution
     if not load_key("burn_subtitles"):
-        rprint("[bold yellow]Warning: A 0-second black video will be generated as a placeholder as subtitles are not burned in.[/bold yellow]")
+        rprint(
+            "[bold yellow]Warning: A 0-second black video will be generated as a placeholder as subtitles are not burned in.[/bold yellow]")
 
         # Create a black frame
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -58,7 +61,7 @@ def merge_subtitles_to_video():
         rprint("[bold green]Placeholder video has been generated.[/bold green]")
         return
 
-    if not os.path.exists(SRC_SRT) or not os.path.exists(TRANS_SRT):
+    if not os.path.exists(TRANS_SRT):
         rprint("Subtitle files not found in the 'output' directory.")
         exit(1)
 
@@ -67,15 +70,20 @@ def merge_subtitles_to_video():
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
+
+    # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video
+    is_portrait = TARGET_HEIGHT > TARGET_WIDTH
+    trans_font_size = load_key("zh_pipeline.portrait_font_size") if is_portrait else TRANS_FONT_SIZE
+    if is_portrait:
+        rprint(f"[bold cyan]Video dọc (portrait) -> giảm font sub còn {trans_font_size}[/bold cyan]")
+
+    # Chỉ burn sub Việt (đã dịch), không burn sub gốc
     ffmpeg_cmd = [
         'ffmpeg', '-i', video_file,
         '-vf', (
             f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={SRC_SRT}:force_style='FontSize={SRC_FONT_SIZE},FontName={FONT_NAME}," 
-            f"PrimaryColour={SRC_FONT_COLOR},OutlineColour={SRC_OUTLINE_COLOR},OutlineWidth={SRC_OUTLINE_WIDTH},"
-            f"ShadowColour={SRC_SHADOW_COLOR},BorderStyle=1',"
-            f"subtitles={TRANS_SRT}:force_style='FontSize={TRANS_FONT_SIZE},FontName={TRANS_FONT_NAME},"
+            f"subtitles={TRANS_SRT}:force_style='FontSize={trans_font_size},FontName={TRANS_FONT_NAME},"
             f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
             f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
         ).encode('utf-8'),
@@ -101,6 +109,7 @@ def merge_subtitles_to_video():
         rprint(f"\n❌ Error occurred: {e}")
         if process.poll() is None:
             process.kill()
+
 
 if __name__ == "__main__":
     merge_subtitles_to_video()
