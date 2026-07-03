@@ -59,8 +59,10 @@ def merge_video_audio():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
 
-    if load_key("whisper.language") == "zh":
-        DUB_SUB_FILE = 'output/audio/trans_subs_for_audio.srt'
+    # dub.srt (từ _11_merge_audio.create_srt_subtitle) đã được tính theo THỜI LƯỢNG AUDIO TTS THẬT
+    # (new_sub_times), khớp đúng nhịp giọng đọc — dùng chung cho cả zh, KHÔNG override sang
+    # trans_subs_for_audio.srt nữa (file đó dùng thời lượng câu gốc tiếng Trung, không khớp giọng đọc
+    # tiếng Việt, gây ra hiện tượng sub chạy tiếp trong khi TTS đã đọc xong).
 
     # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video
     is_portrait = TARGET_HEIGHT > TARGET_WIDTH

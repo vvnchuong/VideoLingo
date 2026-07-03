@@ -209,18 +209,17 @@ def _get_audio_steps():
         _lang = "en"
 
     if _lang == "zh":
-        from core.zh_pipeline import zh_gen_audio_tasks
+        from core.zh_pipeline import zh_gen_audio_tasks, zh_restore_noise_segments
         return [
-            (
-                t("Generate audio tasks and chunks"),
-                lambda: (
-                    zh_gen_audio_tasks(),
-                    _8_2_dub_chunks.gen_dub_chunks(),
-                ),
-            ),
+            # zh_gen_audio_tasks() đã tự set đúng cột 'lines'/'src_lines' (dùng _split_text_for_sub) —
+            # KHÔNG gọi _8_2_dub_chunks.gen_dub_chunks() nữa vì hàm đó dò lại lines bằng cách khớp
+            # nội dung theo INDEX giữa src.srt/trans.srt, mà 2 file này của zh có số dòng lệch nhau
+            # (zh đặc chữ ít dòng hơn, vi dài hơn nhiều dòng hơn) -> dễ lệch dữ liệu hoặc IndexError.
+            (t("Generate audio tasks and chunks"), lambda: zh_gen_audio_tasks()),
             (t("Extract reference audio"), _9_refer_audio.extract_refer_audio_main),
             (t("Generate and merge audio files"), _10_gen_audio.gen_audio),
             (t("Merge full audio"), _11_merge_audio.merge_full_audio),
+            (t("Restore noise/effect segments"), zh_restore_noise_segments),
             (t("Merge final audio into video"), _12_dub_to_vid.merge_video_audio),
         ]
 

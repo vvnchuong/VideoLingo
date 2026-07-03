@@ -155,3 +155,6 @@ zh_pipeline:
   whisper_model_zh: 'medium'
   demucs_for_vad: true
   demucs_model: 'htdemucs'
+  portrait_font_size: 10
+  tts_split_max_chars: 60
+  no_speech_threshold: 0.95

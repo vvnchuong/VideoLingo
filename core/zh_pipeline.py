@@ -25,6 +25,11 @@ SRC_AUDIO_SRT   = os.path.join(_AUDIO_DIR, "src_subs_for_audio.srt")
 # KHÔNG dùng translation_results.xlsx (_4_2_TRANSLATION) vì đó là file của pipeline EN/other,
 # không liên quan tới ZH, tuyệt đối không đụng vào.
 ZH_SYNC_JSON = os.path.join(_OUTPUT_DIR, "log", "zh_sync.json")
+# Lưu lại các khoảng [start,end] đã bị lọc là "tiếng động/hiệu ứng/nói nhảm không rõ nghĩa" lúc
+# transcribe, để sau đó chèn LẠI audio gốc (mèo kêu, hiệu ứng...) vào đúng chỗ đó trong bản dub,
+# tránh bị im lặng hoàn toàn.
+ZH_NOISE_JSON = os.path.join(_OUTPUT_DIR, "log", "zh_noise_ranges.json")
+DUB_AUDIO_FILE = os.path.join(_OUTPUT_DIR, "dub.mp3")
 
 def _cfg(key, fallback=None):
     try: return load_key(key)
@@ -275,10 +280,32 @@ def _unload_models():
     _unload_whisper()
     _unload_vad()
 
+def _looks_like_noise(text, segments_list, no_speech_threshold=None):
+    """Lọc đoạn Whisper 'nghe nhầm' từ tiếng động/hiệu ứng/nhạc thành chữ vô nghĩa —
+    ví dụ mèo kêu, tiếng động ra chữ kiểu 'by bwd6'. Dấu hiệu: hoàn toàn không có chữ Hán
+    (audio khai là zh mà không ra nổi 1 chữ Hán nào là rất đáng ngờ), hoặc whisper tự báo
+    no_speech_prob cao (model tự tin là không có tiếng nói)."""
+    if no_speech_threshold is None:
+        no_speech_threshold = _cfg("zh_pipeline.no_speech_threshold", 0.6)
+    if not text.strip():
+        return True
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in text)
+    if not has_cjk:
+        return True
+    try:
+        probs = [getattr(s, "no_speech_prob", 0.0) for s in segments_list]
+        if probs and (sum(probs) / len(probs)) > no_speech_threshold:
+            return True
+    except Exception:
+        pass
+    return False
+
 def transcribe_vad_clips(video_path, vad_segs, tmp_dir):
     wm = _load_faster_whisper()
     data = []
+    noise_ranges = []
     rprint(f"[cyan]🎤 Whisper transcribe {len(vad_segs)} segments (reload mỗi {WHISPER_RELOAD_EVERY} clips)...[/cyan]")
+    skipped = 0
     for i, seg in enumerate(vad_segs):
         # ── VRAM: reload định kỳ theo WHISPER_RELOAD_EVERY ───────────────────
         if i > 0 and i % WHISPER_RELOAD_EVERY == 0:
@@ -300,9 +327,21 @@ def transcribe_vad_clips(video_path, vad_segs, tmp_dir):
             # ── VRAM flush sau mỗi clip ───────────────────────────────────────
             if torch.cuda.is_available(): torch.cuda.empty_cache()
             # ─────────────────────────────────────────────────────────────────
+        if _looks_like_noise(text, segments_list):
+            skipped += 1
+            noise_ranges.append({"start": seg["start"], "end": seg["end"]})
+            rprint(f"   [{i+1:03d}] {seg['start']:.2f}–{seg['end']:.2f}s | [dim]⏭️  bỏ qua (nghi tiếng động/hiệu ứng): {text[:60]}[/dim]")
+            continue
         data.append({"start": seg["start"], "end": seg["end"], "zh": text})
         rprint(f"   [{i+1:03d}] {seg['start']:.2f}–{seg['end']:.2f}s | {text[:60]}")
+    if skipped:
+        rprint(f"[yellow]ℹ Đã bỏ qua {skipped} đoạn nghi là tiếng động/hiệu ứng (không có chữ Hán hoặc no_speech_prob cao)[/yellow]")
+    os.makedirs(os.path.dirname(ZH_NOISE_JSON), exist_ok=True)
+    with open(ZH_NOISE_JSON, "w", encoding="utf-8") as f:
+        json.dump(noise_ranges, f, ensure_ascii=False, indent=2)
     return data
+
+
 
 _TRANSLATE_PROMPT = """\
 Bạn là phiên dịch viên lồng tiếng chuyên nghiệp Trung → Việt.
@@ -481,15 +520,59 @@ def zh_asr_and_translate(session_id=None):
         shutil.rmtree(tmp_dir,ignore_errors=True)
 
 def _split_text_for_sub(text, max_chars=42):
-    words = text.split()
+    """Ưu tiên cắt tại dấu câu/dấu phẩy (giữ trọn cụm từ, TTS đọc không bị cụt giữa câu),
+    chỉ cắt cứng theo từng từ khi 1 cụm giữa 2 dấu câu vẫn dài hơn max_chars."""
+    text = text.strip()
+    if not text: return [text]
+    raw_parts = re.split(r'(?<=[\.\!\?,;:…])\s+', text)
+    raw_parts = [p.strip() for p in raw_parts if p.strip()] or [text]
     lines, cur = [], ""
-    for w in words:
-        if cur and len(cur) + 1 + len(w) > max_chars:
-            lines.append(cur); cur = w
+    for p in raw_parts:
+        if cur and len(cur) + 1 + len(p) > max_chars:
+            lines.append(cur); cur = p
+        elif len(p) > max_chars:
+            if cur: lines.append(cur); cur = ""
+            words, line = p.split(), ""
+            for w in words:
+                if line and len(line) + 1 + len(w) > max_chars:
+                    lines.append(line); line = w
+                else:
+                    line = (line + " " + w).strip() if line else w
+            if line: cur = line
         else:
-            cur = (cur + " " + w).strip() if cur else w
+            cur = (cur + " " + p).strip() if cur else p
     if cur: lines.append(cur)
     return lines if lines else [text]
+
+def zh_restore_noise_segments():
+    """Chèn lại audio GỐC (raw.mp3 — có cả tiếng mèo kêu/hiệu ứng/nói nhảm) vào đúng những khoảng
+    thời gian đã bị lọc lúc transcribe (không có chữ Hán hoặc no_speech_prob cao), tránh bị im lặng
+    hoàn toàn ở những đoạn đó trong bản dub. Chạy sau bước 'Merge full audio', trước khi burn video."""
+    if not os.path.exists(ZH_NOISE_JSON):
+        return
+    with open(ZH_NOISE_JSON, encoding="utf-8") as f:
+        ranges = json.load(f)
+    if not ranges:
+        rprint("[cyan]ℹ Không có đoạn nào bị lọc noise cần chèn lại audio gốc[/cyan]")
+        return
+    if not os.path.exists(DUB_AUDIO_FILE) or not os.path.exists(_RAW_AUDIO_FILE):
+        rprint("[yellow]⚠️ Thiếu dub.mp3 hoặc raw.mp3, bỏ qua bước chèn lại audio gốc[/yellow]")
+        return
+    from pydub import AudioSegment
+    dub = AudioSegment.from_file(DUB_AUDIO_FILE)
+    raw = AudioSegment.from_file(_RAW_AUDIO_FILE)
+    out = dub
+    inserted = 0
+    for r in ranges:
+        start_ms, end_ms = int(r["start"]*1000), int(r["end"]*1000)
+        end_ms = min(end_ms, len(raw), len(dub))
+        if start_ms >= end_ms: continue
+        clip = raw[start_ms:end_ms]
+        out = out.overlay(clip, position=start_ms)
+        inserted += 1
+    os.makedirs(os.path.dirname(DUB_AUDIO_FILE), exist_ok=True)
+    out.export(DUB_AUDIO_FILE, format="mp3", parameters=["-b:a", "64k"])
+    rprint(f"[green]✅ Đã chèn lại audio gốc cho {inserted}/{len(ranges)} đoạn bị lọc (tiếng động/hiệu ứng)[/green]")
 
 def zh_gen_audio_tasks(session_id=None):
     rprint("[bold magenta]🚀 ZH: Gen audio tasks[/bold magenta]")
@@ -538,9 +621,14 @@ def zh_gen_audio_tasks(session_id=None):
         elif est<dur-tol_v: return -1
         else: return 0
     df["if_too_fast"]=df.apply(_if_too_fast,axis=1)
-    df["cut_off"]=0
-    df.loc[df["gap"]>=tol_cfg,"cut_off"]=1; df.loc[n-1,"cut_off"]=1
-    df["lines"]=df["text"].apply(lambda t:_split_text_for_sub(str(t)))
+    # ZH: LUÔN để mỗi dòng là 1 "chunk" riêng (cut_off=1 toàn bộ) — không gộp nhiều dòng liền kề lại
+    # để tính chung tốc độ đọc, vì merge_chunks() (dùng chung với EN) có thể tự XÓA khoảng lặng giữa
+    # các dòng trong cùng 1 chunk (keep_gaps=False) khi audio hơi dài, làm dòng sau phát sớm hơn hẳn
+    # so với timestamp gốc trong video. Ép mỗi dòng độc lập -> giữ đúng start_time gốc của từng dòng,
+    # chỉ co giãn tốc độ audio bên trong chính dòng đó nếu cần.
+    df["cut_off"]=1
+    tts_max_chars = _cfg("zh_pipeline.tts_split_max_chars", 60)
+    df["lines"]=df["text"].apply(lambda t:_split_text_for_sub(str(t), max_chars=tts_max_chars))
     df["src_lines"]=df["origin"].apply(lambda t:[str(t)])
     df["real_dur"]=0.0; df["new_sub_times"]=None
     os.makedirs(os.path.dirname(_8_1_AUDIO_TASK),exist_ok=True)
