@@ -1,18 +1,3 @@
-"""
-OmniVoice custom TTS cho VideoLingo
-Nhét vào core/all_tts_functions/custom_tts.py
-
-Ưu điểm so với VieNeu:
-- Có speed param thật → sync tốt hơn, ít cần atempo
-- GPU mode với RTX 4050 → nhanh hơn CPU OmniVoice cũ
-- Fine-tune tiếng Việt: splendor1811/omnivoice-vietnamese
-
-Cài đặt:
-  pip install omnivoice
-
-Lần đầu chạy sẽ tự download model ~vài GB về HF_HOME
-"""
-
 import os
 import random
 import time
@@ -21,16 +6,28 @@ import numpy as np
 import soundfile as sf
 import torch
 
-# ── Config ──────────────────────────────────────────────────────────────────
+def _apply_hf_home_from_config():
+    try:
+        import yaml
+        from pathlib import Path
+        config_path = Path(__file__).parent.parent.parent / "config.yaml"
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        hf_home = (cfg.get("vieneu", {}) or {}).get("hf_home", "")
+        if hf_home:
+            os.environ.setdefault("HF_HOME", hf_home)
+    except Exception as e:
+        print(f"[OmniVoice] ⚠️ Không đọc được hf_home từ config.yaml: {e}")
 
-MODEL_ID = "splendor1811/omnivoice-vietnamese"  # VI fine-tune
-# MODEL_ID = "k2-fsa/OmniVoice"                # base multilingual
+_apply_hf_home_from_config()
+
+
+MODEL_ID = "splendor1811/omnivoice-vietnamese"
+# MODEL_ID = "k2-fsa/OmniVoice"
 
 DEFAULT_VOICE_INSTRUCT = "female, young adult, moderate pitch"
 DEFAULT_SPEED = 1.0
 DEFAULT_SEED = 42
-
-# ── Seed helper ──────────────────────────────────────────────────────────────
 
 def _set_seed(seed: int):
     random.seed(seed)
@@ -40,9 +37,6 @@ def _set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-
-# ── Model singleton ──────────────────────────────────────────────────────────
-
 _model = None
 
 def _get_model():
@@ -59,31 +53,12 @@ def _get_model():
         print("[OmniVoice] Model loaded ✓")
     return _model
 
-
-# ── Main function VideoLingo gọi ─────────────────────────────────────────────
-
 def omnivoice_tts(text: str, output_path: str, speed: float = DEFAULT_SPEED, seed: int = DEFAULT_SEED) -> str:
-    """
-    Generate TTS với OmniVoice.
-
-    Args:
-        text: văn bản tiếng Việt cần đọc
-        output_path: đường dẫn file output (.wav)
-        speed: tốc độ nói (0.8 chậm ~ 1.3 nhanh), default 1.0
-        seed: random seed để output ổn định, default 42
-
-    Returns:
-        output_path nếu thành công
-    """
     model = _get_model()
-
-    # Set seed trước mỗi lần generate — không pass vào model.generate()
-    # vì OmniVoice không có param seed trong API
     _set_seed(seed)
 
     t0 = time.time()
 
-    # Thử noise_scale=0 nếu model hỗ trợ (VITS-based), fallback nếu không
     try:
         audio = model.generate(
             text=text,
@@ -93,7 +68,6 @@ def omnivoice_tts(text: str, output_path: str, speed: float = DEFAULT_SPEED, see
             noise_scale_w=0.0,
         )
     except TypeError:
-        # Model không có noise_scale param → dùng generate thường
         audio = model.generate(
             text=text,
             instruct=DEFAULT_VOICE_INSTRUCT,
@@ -111,26 +85,35 @@ def omnivoice_tts(text: str, output_path: str, speed: float = DEFAULT_SPEED, see
     return output_path
 
 
-# ── Ref audio variant ────────────────────────────────────────────────────────
-
 REF_AUDIO = os.path.join(os.path.dirname(__file__), "reference.wav")
 
 def omnivoice_tts_with_ref(text: str, save_path: str, seed: int = DEFAULT_SEED) -> None:
     import soundfile as sf_reader
+    if not os.path.exists(REF_AUDIO):
+        raise FileNotFoundError(
+            f"Chưa có file giọng mẫu tại {REF_AUDIO}. "
+            f"Cần 1 file .wav ngắn (5-15s), giọng nữ rõ ràng, ít tạp âm, đặt tên 'reference.wav' "
+            f"trong thư mục core/tts_backend/ để clone giọng ổn định qua các câu."
+        )
     model = _get_model()
 
     _set_seed(seed)
 
     ref_waveform, ref_sr = sf_reader.read(REF_AUDIO, dtype='float32')
+    if ref_waveform.ndim == 2:
+        ref_waveform = ref_waveform.mean(axis=1)  # stereo -> mono
 
     audio = model.generate(
         text=text,
-        ref_audio=ref_waveform,
-        ref_sr=ref_sr,
+        ref_audio=(ref_waveform, ref_sr),
     )
 
+    # Xử lý linh hoạt kiểu trả về (tuple/list/array thô) — tránh giả định cứng audio[0]
+    if isinstance(audio, (tuple, list)):
+        audio = audio[0]
+
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-    sf.write(save_path, audio[0], samplerate=24000)
+    sf.write(save_path, audio, samplerate=24000)
 
 
 # ── Tích hợp vào VideoLingo custom_tts.py ────────────────────────────────────
@@ -168,7 +151,6 @@ if __name__ == "__main__":
         omnivoice_tts(text, out, speed=1.0)
         print(f"     → Saved: {out}\n")
 
-    # Test reproducibility — generate 2 lần cùng text, output phải giống nhau
     print("=== Test reproducibility ===\n")
     text = "Kiểm tra tính ổn định của seed."
     omnivoice_tts(text, "test_output/repro_1.wav")

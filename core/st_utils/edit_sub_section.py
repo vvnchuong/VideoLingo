@@ -13,16 +13,11 @@ from core.utils.delete_retry_dubbing import delete_dubbing_files
 SRC_SRT   = "output/src.srt"
 TRANS_SRT = "output/trans.srt"
 SUB_VIDEO = "output/output_sub.mp4"
-# Phải khớp với ZH_SYNC_JSON trong core/zh_pipeline.py — không import module đó ở đây
-# vì nó kéo theo torch/faster-whisper/google-genai nặng, chỉ cần khớp path là đủ.
 ZH_SYNC_JSON = "output/log/zh_sync.json"
 
 MAX_DISPLAY_CHARS = 42
 
 def _split_sub_for_display(text, start_s, end_s, max_chars=MAX_DISPLAY_CHARS):
-    """Copy độc lập từ core.zh_pipeline._split_sub_for_display (không import cả module zh_pipeline
-    vì nó nặng torch/faster-whisper). Tách câu dài thành nhiều dòng hiển thị theo thời lượng,
-    tránh burn ra 1 khối chữ dài che hết video."""
     text = text.strip()
     if not text: return []
     raw_parts = re.split(r'(?<=[\.\!\?,;:…])\s+', text)
@@ -145,11 +140,11 @@ def _apply_edits(rows):
 
 
 def edit_sub_section():
-    st.header("b.5 Review & Edit Subtitles")
-
     sync_rows = _load_zh_sync()
     if sync_rows is None:
         return False
+
+    st.header("b.5 Review & Edit Subtitles")
 
     with st.container(border=True):
         st.caption(
