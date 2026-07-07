@@ -473,18 +473,39 @@ def zh_asr_and_translate(session_id=None):
     tmp_dir=tempfile.mkdtemp(prefix="zh_pipe_")
     try:
         os.makedirs(_AUDIO_DIR,exist_ok=True)
+
+        subtitle_source = _cfg("subtitle_source", "whisper")
+
+        # Luôn extract raw audio bất kể nguồn phụ đề nào, vì bước gen audio task
+        # phía sau (get_audio_duration) cần file này để tính duration
         if not os.path.exists(_RAW_AUDIO_FILE):
             rprint("[cyan]⏳ Extract raw audio...[/cyan]")
             subprocess.run(["ffmpeg","-i",video_path,"-vn","-acodec","libmp3lame","-q:a","2","-y",_RAW_AUDIO_FILE],
                            capture_output=True, check=True)
             rprint(f"[green]✅ Raw audio → {_RAW_AUDIO_FILE}[/green]")
-        vad_segs=get_vad_segments(video_path,tmp_dir)
-        if not vad_segs: raise RuntimeError("VAD không tìm thấy đoạn nói nào")
-        _unload_vad()       # giải phóng VRAM trước khi load Whisper
-        data=transcribe_vad_clips(video_path,vad_segs,tmp_dir)
-        data=[d for d in data if d["zh"].strip()]
-        if not data: raise RuntimeError("Whisper không transcribe được")
-        _unload_whisper()   # giải phóng VRAM trước Gemini
+
+        if subtitle_source == "ocr":
+            # ── Nhánh OCR: đọc sub cứng có sẵn, bỏ qua VAD + Whisper ──────────
+            from core.asr_backend.hardsub_ocr import extract_hardsub
+            rprint("[cyan]🔎 Đọc phụ đề cứng (hardsub) bằng OCR...[/cyan]")
+            ocr_result = extract_hardsub(video_path, lang="ch")
+            raw_segments = ocr_result.get("segments", [])
+            data = [
+                {"start": seg["start"], "end": seg["end"], "zh": seg["text"].strip()}
+                for seg in raw_segments if seg.get("text", "").strip()
+            ]
+            if not data: raise RuntimeError("OCR không đọc được sub nào từ video")
+            rprint(f"[green]✅ OCR: {len(data)} câu sub được nhận diện[/green]")
+        else:
+            # ── Nhánh Whisper: VAD + faster-whisper như cũ ─────────────────────
+            vad_segs=get_vad_segments(video_path,tmp_dir)
+            if not vad_segs: raise RuntimeError("VAD không tìm thấy đoạn nói nào")
+            _unload_vad()       # giải phóng VRAM trước khi load Whisper
+            data=transcribe_vad_clips(video_path,vad_segs,tmp_dir)
+            data=[d for d in data if d["zh"].strip()]
+            if not data: raise RuntimeError("Whisper không transcribe được")
+            _unload_whisper()   # giải phóng VRAM trước Gemini
+
         client=_gemini_client()
         is_portrait = _is_portrait_video(video_path)
         if is_portrait:
@@ -528,26 +549,30 @@ def zh_gen_audio_tasks(session_id=None):
     estimator=init_estimator()
     accept=_cfg("speed_factor.accept",1.2); tol_cfg=_cfg("tolerance",1.5)
     min_dur=_cfg("min_subtitle_duration",2.5); whole_dur=get_audio_duration(_RAW_AUDIO_FILE)
+    subtitle_source = _cfg("subtitle_source", "whisper")
     rows=[]
     for i,r in enumerate(sync_rows):
         rows.append({"number":i+1,"text":r["vi"],"origin":r["zh"],
                      "start_time":_srt_time_dot(r["start"]),"end_time":_srt_time_dot(r["end"]),
                      "duration":round(r["end"]-r["start"],3)})
-    i=0
-    while i<len(rows):
-        dur=rows[i]["duration"]
-        if dur<min_dur:
-            if i+1<len(rows):
-                combined=_parse_dot_time(rows[i+1]["end_time"])-_parse_dot_time(rows[i]["start_time"])
-                if combined<min_dur*2:
-                    rprint(f"[yellow]Merge row {i+1}+{i+2}[/yellow]")
-                    rows[i]["text"]+=" "+rows[i+1]["text"]; rows[i]["origin"]+=" "+rows[i+1]["origin"]
-                    rows[i]["end_time"]=rows[i+1]["end_time"]; rows[i]["duration"]=combined
-                    rows.pop(i+1); continue
-                else:
-                    rows[i]["end_time"]=_srt_time_dot(_parse_dot_time(rows[i]["start_time"])+min_dur)
-                    rows[i]["duration"]=min_dur
-        i+=1
+    if subtitle_source != "ocr":
+        # Chỉ merge câu ngắn khi dùng Whisper (VAD hay cắt câu vụn).
+        # OCR đọc đúng nhịp sub gốc rồi, ép merge sẽ làm sai lệch hiển thị.
+        i=0
+        while i<len(rows):
+            dur=rows[i]["duration"]
+            if dur<min_dur:
+                if i+1<len(rows):
+                    combined=_parse_dot_time(rows[i+1]["end_time"])-_parse_dot_time(rows[i]["start_time"])
+                    if combined<min_dur*2:
+                        rprint(f"[yellow]Merge row {i+1}+{i+2}[/yellow]")
+                        rows[i]["text"]+=" "+rows[i+1]["text"]; rows[i]["origin"]+=" "+rows[i+1]["origin"]
+                        rows[i]["end_time"]=rows[i+1]["end_time"]; rows[i]["duration"]=combined
+                        rows.pop(i+1); continue
+                    else:
+                        rows[i]["end_time"]=_srt_time_dot(_parse_dot_time(rows[i]["start_time"])+min_dur)
+                        rows[i]["duration"]=min_dur
+            i+=1
     df=pd.DataFrame(rows); n=len(df)
     df["gap"]=0.0
     for i in range(n-1):

@@ -4,28 +4,29 @@ display_language: "en"
 
 # API settings
 api:
-  key: 'YOUR_KEY_HERE'
+  key: 'YOUR_API_KEY'
   keys:
-    - 'YOUR_KEY_HERE'
-    - 'YOUR_KEY_HERE'
-    - 'YOUR_KEY_HERE'
-  # key: 'YOUR_KEY_HERE'
-  base_url: 'YOUR_BASE_URL'
-  # base_url: 'YOUR_BASE_URL'
-  model: 'YOUR_MODEL'
-  # model: 'YOUR_MODEL'
-  # model: 'YOUR_MODEL'
+  - 'YOUR_API_KEY'
+  - 'YOUR_API_KEY'
+  - 'YOUR_API_KEY'
+#  key: 'YOUR_API_KEY'
+  base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'
+#  base_url: 'https://api.groq.com/openai/v1'
+  model: 'gemini-3.1-flash-lite'
+#  model: 'qwen/qwen3-32b'
+#  model: 'meta-llama/llama-4-scout-17b-16e-instruct'
   llm_support_json: true
 max_workers: 1
 
 target_language: 'Tiếng Việt'
+subtitle_source: 'ocr'
 
 demucs: false
 
 whisper:
   model: 'medium'
   language: 'zh'
-  detected_language: 'zh'
+  detected_language: 'en'
   runtime: 'local'
   whisperX_302_api_key: ''
   elevenlabs_api_key: ''
@@ -141,7 +142,7 @@ language_split_without_space:
 
 vieneu:
   mode: "v3turbo"
-  voice: "Trọng Hữu"
+  voice: "Trúc Ly"
   hf_home: "D:/hf_cache"
 
 ## ======================== ZH Pipeline ======================== ##
@@ -155,6 +156,9 @@ zh_pipeline:
   whisper_model_zh: 'medium'
   demucs_for_vad: true
   demucs_model: 'htdemucs'
+  # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video (không đổi độ dài sub)
   portrait_font_size: 10
+  # Ngưỡng ký tự để tách 1 câu dịch thành nhiều dòng khi TTS đọc (ưu tiên cắt tại dấu câu/phẩy).
+  # Tăng lên nếu thấy TTS bị khựng/ngắt hơi nhiều giữa câu; giảm xuống nếu sub hiện quá dài/trễ so với thoại.
   tts_split_max_chars: 60
   no_speech_threshold: 0.95

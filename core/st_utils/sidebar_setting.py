@@ -177,6 +177,20 @@ def page_setting():
                 update_key("whisper.language", langs[lang])
                 st.rerun()
 
+        subtitle_source = st.selectbox(
+            t("Nguồn phụ đề"),
+            options=["whisper", "ocr"],
+            format_func=lambda x: "Whisper (tự nhận diện giọng nói)" if x == "whisper" else "OCR (đọc sub cứng có sẵn trong video)",
+            index=["whisper", "ocr"].index(load_key("subtitle_source") or "whisper"),
+            help=t(
+                "Chọn OCR nếu video đã có sẵn sub cứng (hardsub) để có kết quả chính xác hơn Whisper. "
+                "Chọn Whisper nếu video không có sub sẵn."
+            ),
+        )
+        if subtitle_source != load_key("subtitle_source"):
+            update_key("subtitle_source", subtitle_source)
+            st.rerun()
+
         runtime = st.selectbox(
             t("WhisperX Runtime"),
             options=["local", "cloud", "elevenlabs"],
@@ -184,6 +198,7 @@ def page_setting():
             help=t(
                 "Local runtime requires >8GB GPU, cloud runtime requires 302ai API key, elevenlabs runtime requires ElevenLabs API key"
             ),
+            disabled=(subtitle_source == "ocr"),
         )
         if runtime != load_key("whisper.runtime"):
             update_key("whisper.runtime", runtime)
