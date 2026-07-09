@@ -8,7 +8,12 @@
 # def custom_tts(text: str, save_path: str) -> None:
 #     omnivoice_tts_with_ref(text, save_path)
 
-from .omnivoice_tts import omnivoice_tts
+# from .omnivoice_tts import omnivoice_tts
+#
+# def custom_tts(text: str, save_path: str) -> None:
+#     omnivoice_tts(text, save_path)
+
+from .capcut_tts_wrapper import capcut_custom_tts
 
 def custom_tts(text: str, save_path: str) -> None:
-    omnivoice_tts(text, save_path)
+    capcut_custom_tts(text, save_path)

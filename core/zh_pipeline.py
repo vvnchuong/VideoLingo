@@ -24,6 +24,64 @@ def _cfg(key, fallback=None):
     try: return load_key(key)
     except Exception: return fallback
 
+from threading import Lock as _Lock
+_GEMINI_KEY_INDEX = 0
+_GEMINI_KEY_LOCK = _Lock()
+
+def _get_gemini_keys():
+    """
+    Đọc danh sách API key Gemini từ config. Hỗ trợ:
+    - zh_pipeline.gemini_api_keys: list các key
+    - zh_pipeline.gemini_api_key: 1 string (có thể chứa nhiều key cách nhau
+      bởi dấu phẩy/xuống dòng/khoảng trắng - tự tách ra)
+    """
+    keys_list = _cfg("zh_pipeline.gemini_api_keys", None)
+    if isinstance(keys_list, list) and keys_list:
+        return [k.strip() for k in keys_list if str(k).strip()]
+    raw = _cfg("zh_pipeline.gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
+    if not raw:
+        return []
+    parts = re.split(r"[,\n;\s]+", raw.strip())
+    return [p for p in parts if p]
+
+def _get_next_gemini_key(keys):
+    global _GEMINI_KEY_INDEX
+    with _GEMINI_KEY_LOCK:
+        key = keys[_GEMINI_KEY_INDEX % len(keys)]
+        _GEMINI_KEY_INDEX += 1
+        return key
+
+def _gemini_generate(prompt, max_output_tokens=65536):
+    """
+    Gọi Gemini API, tự động XOAY VÒNG qua các key khác nếu key hiện tại bị lỗi
+    (hết quota, rate limit, invalid...). Trả về resp.text hoặc raise nếu hết
+    sạch key mà vẫn lỗi.
+    """
+    keys = _get_gemini_keys()
+    if not keys:
+        raise RuntimeError("Gemini API key not set (zh_pipeline.gemini_api_key)")
+    last_error = None
+    for _ in range(len(keys)):
+        api_key = _get_next_gemini_key(keys)
+        try:
+            client = google_genai.Client(api_key=api_key)
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL, contents=prompt,
+                config=google_genai_types.GenerateContentConfig(
+                    response_mime_type="application/json", max_output_tokens=max_output_tokens))
+            return resp.text
+        except Exception as e:
+            err_str = str(e)
+            is_key_issue = any(s in err_str for s in
+                ["API_KEY_INVALID", "429", "RESOURCE_EXHAUSTED", "quota", "rate"])
+            masked = api_key[-6:] if len(api_key) >= 6 else api_key
+            if is_key_issue and len(keys) > 1:
+                rprint(f"[yellow]⚠ Key ...{masked} lỗi/hết quota, xoay sang key khác...[/yellow]")
+                last_error = e
+                continue
+            raise e
+    raise last_error or RuntimeError("Tất cả API key đều lỗi")
+
 def _is_portrait_video(video_path):
     try:
         cap = cv2.VideoCapture(video_path)
@@ -46,7 +104,7 @@ MAX_DISPLAY_CHARS  = 200  # đồng bộ với zh_pipeline.tts_split_max_chars �
 # đúng 3.5 hay làm câu dịch bị cắt cộc lốc. Nâng lên 4.0 (~1.15x) để AI có đất
 # diễn đạt đầy đủ hơn, tự nhiên hơn, đỡ phải cắt bớt ý.
 SYLLABLE_RATE = _cfg("zh_pipeline.syllable_rate", 4.0)
-TRANSLATE_BATCH    = 300  # Gemini 3.1 Flash-Lite output tối đa 64K token, đủ chứa ~300 câu/request
+TRANSLATE_BATCH    = 200  # cân bằng giữa số request và rủi ro bị cắt cụt output (đã set max_output_tokens=65536)
 CONTEXT_TAIL       = 4
 
 # ── VRAM: reload faster-whisper sau mỗi N clips ──────────────────────────────
@@ -370,9 +428,8 @@ def _gemini_batch(items, client, retries=2, context_block=""):
             .replace("{input_json}",json.dumps(items,ensure_ascii=False)))
     for attempt in range(retries+1):
         try:
-            resp=client.models.generate_content(model=GEMINI_MODEL,contents=prompt,
-                config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
-            raw=re.sub(r"^```(?:json)?\s*|\s*```$","",resp.text.strip())
+            resp_text=_gemini_generate(prompt)
+            raw=re.sub(r"^```(?:json)?\s*|\s*```$","",resp_text.strip())
             rows=json.loads(raw)
             if not isinstance(rows,list): raise ValueError("Not a list")
             vi_map,syl_map,refusals={},{},0
@@ -394,9 +451,8 @@ def _gemini_single(zh_text, duration_s, client, retries=1):
             prompt=(_TRANSLATE_PROMPT.replace("{context_block}","")
                     .replace("{syllable_rate}",str(SYLLABLE_RATE))
                     .replace("{input_json}",json.dumps(items,ensure_ascii=False)))
-            resp=client.models.generate_content(model=GEMINI_MODEL,contents=prompt,
-                config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
-            raw=re.sub(r"^```(?:json)?\s*|\s*```$","",resp.text.strip())
+            resp_text=_gemini_generate(prompt)
+            raw=re.sub(r"^```(?:json)?\s*|\s*```$","",resp_text.strip())
             rows=json.loads(raw)
             if isinstance(rows,list) and rows:
                 vi=rows[0].get("vi","").strip()
@@ -437,7 +493,7 @@ KHÔNG thêm gì khác ngoài JSON.
 {input_json}
 """
 
-def gemini_review_pass(data, client, batch_size=300, context_tail=4):
+def gemini_review_pass(data, client, batch_size=80, context_tail=4):
     """
     Xem lại TOÀN BỘ bản dịch sau khi đã dịch xong lần đầu, theo đúng timeline.
     - Tự phát hiện + loại bỏ dòng watermark/rác lẫn vào do OCR.
@@ -455,10 +511,8 @@ def gemini_review_pass(data, client, batch_size=300, context_tail=4):
         prompt = _REVIEW_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
         for attempt in range(3):
             try:
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt,
-                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                resp_text = _gemini_generate(prompt)
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp_text.strip())
                 rows = json.loads(raw)
                 if not isinstance(rows, list):
                     raise ValueError("Not a list")
@@ -532,7 +586,7 @@ KHÔNG thêm gì khác ngoài JSON.
 {input_json}
 """
 
-def gemini_fix_overlong(data, client, ratio_threshold=1.3, batch_size=300):
+def gemini_fix_overlong(data, client, ratio_threshold=1.3, batch_size=80):
     """
     Pass 3: chỉ nhắm đúng các câu dịch DÀI HƠN ratio_threshold lần so với số
     âm tiết cho phép (duration × SYLLABLE_RATE) - yêu cầu Gemini viết ngắn gọn lại,
@@ -572,10 +626,8 @@ def gemini_fix_overlong(data, client, ratio_threshold=1.3, batch_size=300):
         prompt = _FIX_OVERLONG_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
         for attempt in range(3):
             try:
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt,
-                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                resp_text = _gemini_generate(prompt)
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp_text.strip())
                 rows = json.loads(raw)
                 if not isinstance(rows, list):
                     raise ValueError("Not a list")
@@ -631,7 +683,7 @@ KHÔNG thêm gì khác ngoài JSON.
 {input_json}
 """
 
-def gemini_fix_undershoot(data, client, ratio_threshold=0.85, batch_size=300):
+def gemini_fix_undershoot(data, client, ratio_threshold=0.85, batch_size=80):
     """
     Đối xứng với gemini_fix_overlong: chỉ nhắm đúng các câu dịch NGẮN HƠN
     ratio_threshold lần so với số âm tiết cho phép (TTS phải đọc chậm/kéo dài
@@ -671,10 +723,8 @@ def gemini_fix_undershoot(data, client, ratio_threshold=0.85, batch_size=300):
         prompt = _FIX_UNDERSHOOT_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
         for attempt in range(3):
             try:
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL, contents=prompt,
-                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
-                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                resp_text = _gemini_generate(prompt)
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp_text.strip())
                 rows = json.loads(raw)
                 if not isinstance(rows, list):
                     raise ValueError("Not a list")
