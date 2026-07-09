@@ -36,8 +36,9 @@ import cv2
 from difflib import SequenceMatcher
 
 CROP_TOP_RATIO = 0.75
-SAMPLE_INTERVAL_SEC = 0.5
-SIMILARITY_THRESHOLD = 0.85
+SAMPLE_INTERVAL_SEC = 0.2  # giảm từ 0.5 xuống 0.2 để bắt đúng thời điểm sub xuất hiện,
+                            # tránh trễ tới ~1s do lấy mẫu quá thưa (đổi lại OCR chạy lâu hơn ~2.5x)
+SIMILARITY_THRESHOLD = 0.6
 MIN_TEXT_LEN = 1
 MAX_OCR_WIDTH = 960
 
@@ -65,6 +66,28 @@ def _get_video_fps_and_frame_count(video_path):
 
 def _text_similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
+
+
+def _normalize_for_compare(text):
+    """Bỏ khoảng trắng và các dấu câu vụn (gạch ngang, chấm câu...) trước khi so sánh,
+    vì OCR đôi khi đọc lệch mấy ký tự này (—  vs -, có/không có space...) dù cùng 1 câu."""
+    import re
+    return re.sub(r'[\s\-—.,;:!?…"\'"''、。！？]', '', text)
+
+
+def _is_same_sentence(a, b):
+    """
+    Coi 2 đoạn text là CÙNG 1 câu sub gốc nếu:
+    1. Similarity (sau khi chuẩn hóa) đủ cao, HOẶC
+    2. 1 trong 2 là "chứa" trong cái kia (OCR đọc thiếu/dư chữ nhiễu ở đầu/cuối
+       do vật thể che khuất, hiệu ứng chuyển cảnh...)
+    """
+    na, nb = _normalize_for_compare(a), _normalize_for_compare(b)
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    return _text_similarity(na, nb) >= SIMILARITY_THRESHOLD
 
 
 def _init_ocr_engine(lang="ch"):
@@ -119,32 +142,42 @@ def extract_hardsub(video_path, lang="ch"):
     cap.release()
 
     segments = []
-    current_text = None
+    current_texts = []  # list các text thô trong đoạn hiện tại, để vote chọn bản sạch nhất
     current_start = None
     last_timestamp = 0
 
+    def _finalize_segment(texts, start, end):
+        from collections import Counter
+        # Vote theo bản chuẩn hóa (bỏ dấu câu/khoảng trắng vụn) để chọn nội dung
+        # xuất hiện nhiều nhất, sau đó lấy bản gốc (có dấu câu) dài nhất tương ứng
+        norm_counts = Counter(_normalize_for_compare(t) for t in texts)
+        best_norm, _ = norm_counts.most_common(1)[0]
+        candidates = [t for t in texts if _normalize_for_compare(t) == best_norm]
+        best_text = max(candidates, key=len)
+        segments.append({"start": start, "end": end, "text": best_text})
+
     for timestamp, text in raw_entries:
         if not text or len(text) < MIN_TEXT_LEN:
-            if current_text is not None:
-                segments.append({"start": current_start, "end": last_timestamp, "text": current_text})
-                current_text = None
+            if current_texts:
+                _finalize_segment(current_texts, current_start, last_timestamp)
+                current_texts = []
                 current_start = None
             last_timestamp = timestamp
             continue
 
-        if current_text is None:
-            current_text = text
+        if not current_texts:
+            current_texts = [text]
             current_start = timestamp
-        elif _text_similarity(current_text, text) >= SIMILARITY_THRESHOLD:
-            pass
+        elif _is_same_sentence(current_texts[-1], text):
+            current_texts.append(text)
         else:
-            segments.append({"start": current_start, "end": timestamp, "text": current_text})
-            current_text = text
+            _finalize_segment(current_texts, current_start, timestamp)
+            current_texts = [text]
             current_start = timestamp
         last_timestamp = timestamp
 
-    if current_text is not None:
-        segments.append({"start": current_start, "end": last_timestamp, "text": current_text})
+    if current_texts:
+        _finalize_segment(current_texts, current_start, last_timestamp)
 
     print(f"[OCR-worker] Xong. Tổng {len(segments)} đoạn sub.", flush=True)
     return {"segments": segments}

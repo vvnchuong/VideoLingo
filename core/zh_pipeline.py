@@ -40,8 +40,13 @@ VAD_SPEECH_PAD_MS  = 100
 VAD_MERGE_GAP_S    = 0.12
 MAX_VAD_SEGMENT_S  = 8.0
 GAP_WARN_THRESHOLD = 8.0
-MAX_DISPLAY_CHARS  = 42
-TRANSLATE_BATCH    = 20
+MAX_DISPLAY_CHARS  = 200  # đồng bộ với zh_pipeline.tts_split_max_chars để sub/dub hiển thị nhất quán, 1 câu luôn trọn vẹn
+# Số âm tiết tiếng Việt/giây làm chuẩn khi dịch. 3.5 là tốc độ nói tự nhiên
+# thuần Việt, nhưng tiếng Trung gốc thường đọc nhanh hơn tiếng Việt nên ép về
+# đúng 3.5 hay làm câu dịch bị cắt cộc lốc. Nâng lên 4.0 (~1.15x) để AI có đất
+# diễn đạt đầy đủ hơn, tự nhiên hơn, đỡ phải cắt bớt ý.
+SYLLABLE_RATE = _cfg("zh_pipeline.syllable_rate", 4.0)
+TRANSLATE_BATCH    = 300  # Gemini 3.1 Flash-Lite output tối đa 64K token, đủ chứa ~300 câu/request
 CONTEXT_TAIL       = 4
 
 # ── VRAM: reload faster-whisper sau mỗi N clips ──────────────────────────────
@@ -118,30 +123,37 @@ def _is_refusal(text):
     return any(p in text.lower().strip() for p in patterns)
 
 def _split_sub_for_display(text, start_s, end_s, max_chars=MAX_DISPLAY_CHARS):
-    text=text.strip()
-    if not text: return []
-    raw_parts=re.split(r'(?<=[\.\!\?,;:…])\s+',text)
-    raw_parts=[p.strip() for p in raw_parts if p.strip()] or [text]
-    chunks,cur=[],""
+    """
+    Nếu text dài hơn max_chars, XUỐNG DÒNG (hiển thị cùng lúc trong 1 khung thời gian)
+    thay vì tách thành nhiều đoạn hiển thị nối tiếp nhau theo thời gian - tránh hiện
+    tượng "mất chữ rồi hiện lại" khi sub đang là 1 câu hoàn chỉnh bị chia cắt.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    raw_parts = re.split(r'(?<=[\.\!\?,;:…])\s+', text)
+    raw_parts = [p.strip() for p in raw_parts if p.strip()] or [text]
+    lines, cur = [], ""
     for p in raw_parts:
-        if cur and len(cur)+1+len(p)>max_chars: chunks.append(cur); cur=p
-        elif len(p)>max_chars:
-            if cur: chunks.append(cur); cur=""
-            words,line=p.split(),""
+        if cur and len(cur) + 1 + len(p) > max_chars:
+            lines.append(cur); cur = p
+        elif len(p) > max_chars:
+            if cur: lines.append(cur); cur = ""
+            words, line = p.split(), ""
             for w in words:
-                if line and len(line)+1+len(w)>max_chars: chunks.append(line); line=w
-                else: line=(line+" "+w).strip() if line else w
-            if line: cur=line
-        else: cur=(cur+" "+p).strip() if cur else p
-    if cur: chunks.append(cur)
-    if len(chunks)<=1: return [{"start":start_s,"end":end_s,"text":text}]
-    total_chars=sum(len(c) for c in chunks); total_dur=max(end_s-start_s,0.01)
-    result,t=[],start_s
-    for i,c in enumerate(chunks):
-        share=len(c)/total_chars
-        seg_end=end_s if i==len(chunks)-1 else min(t+total_dur*share,end_s)
-        result.append({"start":t,"end":max(seg_end,t+0.3),"text":c}); t=seg_end
-    return result
+                if line and len(line) + 1 + len(w) > max_chars:
+                    lines.append(line); line = w
+                else:
+                    line = (line + " " + w).strip() if line else w
+            if line: cur = line
+        else:
+            cur = (cur + " " + p).strip() if cur else p
+    if cur: lines.append(cur)
+    if not lines:
+        lines = [text]
+    # Giới hạn tối đa 2 dòng hiển thị cùng lúc (giống chuẩn subtitle thông thường)
+    display_text = "\n".join(lines[:2])
+    return [{"start": start_s, "end": end_s, "text": display_text}]
 
 def _load_vad():
     if _vad_cache["model"] is None:
@@ -335,7 +347,7 @@ xấp xỉ với "duration" (giây) đã cho.
 1. KHÔNG dịch kiểu từ điển, cụt lủn.
 2. Nếu duration ≥ 3s: diễn đạt đầy đủ, dùng cách nói người Việt thật.
 3. Nếu duration < 2s: dịch gọn.
-4. duration × 3.5 ≈ số âm tiết tiếng Việt cần có.
+4. duration × {syllable_rate} ≈ số âm tiết tiếng Việt cần có.
 5. Kết quả nghe như người Việt đang nói, không phải đọc bản dịch.
 6. NHẤT QUÁN: giữ cách xưng hô/tên riêng từ ngữ cảnh trước.
 
@@ -354,6 +366,7 @@ KHÔNG thêm gì khác ngoài JSON.
 
 def _gemini_batch(items, client, retries=2, context_block=""):
     prompt=(_TRANSLATE_PROMPT.replace("{context_block}",context_block)
+            .replace("{syllable_rate}",str(SYLLABLE_RATE))
             .replace("{input_json}",json.dumps(items,ensure_ascii=False)))
     for attempt in range(retries+1):
         try:
@@ -379,6 +392,7 @@ def _gemini_single(zh_text, duration_s, client, retries=1):
     for _ in range(retries+1):
         try:
             prompt=(_TRANSLATE_PROMPT.replace("{context_block}","")
+                    .replace("{syllable_rate}",str(SYLLABLE_RATE))
                     .replace("{input_json}",json.dumps(items,ensure_ascii=False)))
             resp=client.models.generate_content(model=GEMINI_MODEL,contents=prompt,
                 config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
@@ -390,6 +404,302 @@ def _gemini_single(zh_text, duration_s, client, retries=1):
         except Exception: pass
         time.sleep(1.0)
     return ""
+
+_REVIEW_PROMPT = """\
+Bạn là biên tập viên lồng tiếng chuyên nghiệp Trung → Việt, đang xem lại bản
+dịch nháp của cả 1 đoạn video theo đúng thứ tự thời gian (timeline).
+
+## Nhiệm vụ
+Với MỖI dòng, dựa vào câu gốc tiếng Trung, bản dịch nháp hiện tại, và ngữ cảnh
+các câu xung quanh (được cho theo đúng thứ tự), hãy:
+
+1. **Phát hiện rác/watermark - CỰC KỲ THẬN TRỌNG**: chỉ đánh dấu
+   "remove": true khi bạn CHẮC CHẮN GẦN TUYỆT ĐỐI đây không phải lời thoại
+   thực - ví dụ: cùng 1 chuỗi tên kênh/watermark lặp lại y hệt nhau ở nhiều
+   dòng khác nhau trong video, hoặc rõ ràng là logo/URL/tên tài khoản không
+   mang nghĩa gì cả.
+   **MẶC ĐỊNH LÀ GIỮ LẠI ("remove": false) NẾU CÒN CHÚT NGHI NGỜ** - kể cả
+   khi câu đó ngắn, có vẻ lạc quẻ, hay không rõ liên quan mạch truyện, VẪN
+   GIỮ LẠI trừ khi chắc chắn tuyệt đối là rác. Xóa nhầm 1 câu thoại thật gây
+   hậu quả NẶNG HƠN NHIỀU so với việc để sót 1 dòng rác (có thể xóa tay sau).
+2. **Tinh chỉnh bản dịch**: viết lại "vi" cho tự nhiên, có hồn hơn, được phép
+   sáng tạo thêm chút ý nếu giúp câu nói mượt mà, sinh động hơn (như cách biên
+   tập viên lồng tiếng chuyên nghiệp hay làm) - miễn giữ đúng Ý CHÍNH của câu
+   gốc và khớp mạch truyện với câu trước/sau. KHÔNG bịa thêm nội dung không có
+   trong câu gốc, chỉ được diễn đạt lại cho hay hơn.
+3. Vẫn giữ ràng buộc: duration × {syllable_rate} ≈ số âm tiết tiếng Việt cần có.
+
+## Output — JSON list, đúng thứ tự input, đủ cho MỌI dòng:
+[{{"i": 0, "vi": "...", "remove": false}}, ...]
+KHÔNG thêm gì khác ngoài JSON.
+
+## Input (câu gốc, bản dịch nháp, duration, theo đúng timeline)
+{input_json}
+"""
+
+def gemini_review_pass(data, client, batch_size=300, context_tail=4):
+    """
+    Xem lại TOÀN BỘ bản dịch sau khi đã dịch xong lần đầu, theo đúng timeline.
+    - Tự phát hiện + loại bỏ dòng watermark/rác lẫn vào do OCR.
+    - Tinh chỉnh bản dịch cho tự nhiên, sáng tạo hơn, dựa vào ngữ cảnh câu
+      trước/sau (không chỉ dịch rời rạc từng câu như bước đầu).
+    """
+    rprint(f"[cyan]🔎 Review pass: xem lại {len(data)} câu theo ngữ cảnh toàn video...[/cyan]")
+    all_vi, all_remove = {}, {}
+    for bstart in range(0, len(data), batch_size):
+        batch = data[bstart:bstart + batch_size]
+        items = [
+            {"i": bstart + j, "zh": d["zh"], "vi_draft": d["vi"], "duration": round(d["end"] - d["start"], 2)}
+            for j, d in enumerate(batch)
+        ]
+        prompt = _REVIEW_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
+        for attempt in range(3):
+            try:
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL, contents=prompt,
+                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                rows = json.loads(raw)
+                if not isinstance(rows, list):
+                    raise ValueError("Not a list")
+                for row in rows:
+                    if "i" not in row:
+                        continue
+                    idx = row["i"]
+                    if row.get("remove", False):
+                        all_remove[idx] = True
+                        continue
+                    vi = row.get("vi", "").strip()
+                    if vi and not _is_refusal(vi):
+                        all_vi[idx] = vi
+                break
+            except Exception as e:
+                rprint(f"[yellow]⚠ Review batch lỗi (lần {attempt+1}): {e}[/yellow]")
+                time.sleep(1.5)
+
+    result, removed_count, kept_original = [], 0, 0
+    for i, d in enumerate(data):
+        if all_remove.get(i, False):
+            removed_count += 1
+            rprint(f"   [{i+1:03d}] [-] Loại bỏ (nghi watermark/rác): {d['zh'][:40]}")
+            continue
+        vi = all_vi.get(i)
+        if not vi:
+            vi = d["vi"]  # review lỗi/không trả về -> giữ nguyên bản dịch nháp
+            kept_original += 1
+        result.append({"start": d["start"], "end": d["end"], "zh": d["zh"], "vi": vi})
+
+    if removed_count:
+        rprint(f"[yellow]ℹ Đã loại {removed_count} câu nghi là watermark/rác[/yellow]")
+    if kept_original:
+        rprint(f"[yellow]ℹ {kept_original} câu giữ nguyên bản dịch nháp (review lỗi)[/yellow]")
+    rprint(f"[green]✅ Review pass hoàn tất → còn {len(result)} câu[/green]")
+    return result
+
+
+def _count_vi_syllables(text):
+    """Đếm âm tiết tiếng Việt = số từ cách nhau bởi khoảng trắng (mỗi âm tiết
+    tiếng Việt viết rời, cách nhau 1 space theo chính tả chuẩn)."""
+    return len(text.split())
+
+
+_FIX_OVERLONG_PROMPT = """\
+Bạn là biên tập viên lồng tiếng Trung → Việt. Các câu dưới đây đang dịch DÀI
+HƠN nhiều so với thời lượng cho phép, khiến TTS phải đọc nhanh bất thường
+(nghe như tua nhanh/siêu thanh). Hãy viết lại NGẮN GỌN hơn, giữ đúng ý chính,
+và PHẢI khớp mạch với "context_before"/"context_after" (câu trước/sau thật sự
+trong video, chỉ để bạn hiểu mạch truyện - KHÔNG dịch lại các câu ngữ cảnh đó).
+
+## THỨ TỰ ƯU TIÊN (quan trọng nhất trước)
+1. **Câu phải ĐÚNG NGỮ PHÁP tiếng Việt, đọc lên nghe trọn vẹn, không cụt lủn.**
+   Ví dụ SAI: cắt mất từ so sánh "hơn", từ phủ định "không", giới từ quan
+   trọng... làm câu mất nghĩa hoặc sai ngữ pháp. Test nhanh: nếu bạn đọc to
+   câu "vi" lên mà nghe ngang/thiếu/sai nghĩa so với câu gốc → SAI, viết lại.
+2. **Không bịa thêm nội dung/ý không có trong câu gốc.**
+3. allowed_syllables (= duration × {syllable_rate}, làm tròn) chỉ là MỤC TIÊU
+   THAM KHẢO để cắt gọn - KHÔNG BẮT BUỘC phải khớp chính xác. Thà lệch vài âm
+   tiết còn hơn một câu sai ngữ pháp hoặc mất nghĩa.
+
+## Cách làm đúng
+Ưu tiên cách diễn đạt cô đọng hơn (từ đồng nghĩa ngắn hơn, bỏ từ đệm không
+cần thiết) thay vì cắt trụi các từ có chức năng ngữ pháp quan trọng.
+
+## Output — JSON list, đúng thứ tự input:
+[{{"i": 0, "vi": "..."}}, ...]
+KHÔNG thêm gì khác ngoài JSON.
+
+## Input
+{input_json}
+"""
+
+def gemini_fix_overlong(data, client, ratio_threshold=1.3, batch_size=300):
+    """
+    Pass 3: chỉ nhắm đúng các câu dịch DÀI HƠN ratio_threshold lần so với số
+    âm tiết cho phép (duration × SYLLABLE_RATE) - yêu cầu Gemini viết ngắn gọn lại,
+    kèm ngữ cảnh câu trước/sau LẤY ĐỘNG từ chính data của video đang xử lý
+    (không phải nội dung cố định), để giữ đúng mạch truyện khi rút gọn.
+    """
+    overlong_idx = []
+    for i, d in enumerate(data):
+        dur = d["end"] - d["start"]
+        allowed = max(round(dur * SYLLABLE_RATE), 1)
+        actual = _count_vi_syllables(d["vi"])
+        if actual > allowed * ratio_threshold:
+            overlong_idx.append(i)
+
+    if not overlong_idx:
+        rprint("[green]✅ Không có câu nào bị dài quá mức, bỏ qua pass 3[/green]")
+        return data
+
+    rprint(f"[cyan]✂️  Pass 3: {len(overlong_idx)}/{len(data)} câu bị dài quá mức, viết ngắn lại...[/cyan]")
+    all_vi = {}
+    for bstart in range(0, len(overlong_idx), batch_size):
+        batch_idx = overlong_idx[bstart:bstart + batch_size]
+        items = []
+        for idx in batch_idx:
+            d = data[idx]
+            dur = d["end"] - d["start"]
+            allowed = max(round(dur * SYLLABLE_RATE), 1)
+            items.append({
+                "i": idx,
+                "zh": d["zh"],
+                "vi_hien_tai": d["vi"],
+                "duration": round(dur, 2),
+                "allowed_syllables": allowed,
+                "context_before": data[idx - 1]["vi"] if idx - 1 >= 0 else "",
+                "context_after": data[idx + 1]["vi"] if idx + 1 < len(data) else "",
+            })
+        prompt = _FIX_OVERLONG_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
+        for attempt in range(3):
+            try:
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL, contents=prompt,
+                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                rows = json.loads(raw)
+                if not isinstance(rows, list):
+                    raise ValueError("Not a list")
+                for row in rows:
+                    if "i" not in row:
+                        continue
+                    vi = row.get("vi", "").strip()
+                    if vi and not _is_refusal(vi):
+                        all_vi[row["i"]] = vi
+                break
+            except Exception as e:
+                rprint(f"[yellow]⚠ Fix-overlong batch lỗi (lần {attempt+1}): {e}[/yellow]")
+                time.sleep(1.5)
+
+    fixed_count = 0
+    for idx in overlong_idx:
+        if idx in all_vi:
+            old_syl = _count_vi_syllables(data[idx]["vi"])
+            new_syl = _count_vi_syllables(all_vi[idx])
+            rprint(f"   [{idx+1:03d}] {old_syl}→{new_syl} âm tiết | {all_vi[idx][:50]}")
+            data[idx]["vi"] = all_vi[idx]
+            fixed_count += 1
+    rprint(f"[green]✅ Pass 3 hoàn tất → đã sửa {fixed_count}/{len(overlong_idx)} câu quá dài[/green]")
+    return data
+
+
+_FIX_UNDERSHOOT_PROMPT = """\
+Bạn là biên tập viên lồng tiếng Trung → Việt. Các câu dưới đây đang dịch NGẮN
+HƠN nhiều so với thời lượng cho phép, khiến TTS phải đọc chậm bất thường
+(nghe rề rà, kéo dài, ê a). Hãy viết lại DÀI RA tự nhiên hơn, và PHẢI khớp
+mạch với "context_before"/"context_after" (câu trước/sau thật sự trong video,
+chỉ để bạn hiểu mạch truyện - KHÔNG dịch lại các câu ngữ cảnh đó).
+
+## THỨ TỰ ƯU TIÊN (quan trọng nhất trước)
+1. **TUYỆT ĐỐI KHÔNG bịa thêm Ý/HÀNH ĐỘNG/CHI TIẾT không có trong câu gốc.**
+   Chỉ được: lặp lại ý đã nói theo cách khác, thêm từ đệm/trợ từ cuối câu
+   (à, nhé, đó, mà, thôi...), diễn giải cùng 1 ý bằng nhiều từ hơn.
+   VÍ DỤ SAI (đã từng xảy ra, TUYỆT ĐỐI KHÔNG lặp lại):
+     zh="知道了" (chỉ là "biết rồi") → SAI: "Tôi biết rồi, biết rồi mà, cằn
+     nhằn mãi thôi" (bịa thêm ý "bị cằn nhằn" không có trong câu gốc).
+     ĐÚNG hơn: "Biết rồi, biết rồi, tôi biết rồi mà" (chỉ lặp lại ý gốc).
+2. **Câu phải ĐÚNG NGỮ PHÁP, nghe tự nhiên như người Việt nói**, không nhồi
+   nhét từ vô nghĩa.
+3. allowed_syllables (= duration × {syllable_rate}, làm tròn) chỉ là MỤC TIÊU
+   THAM KHẢO - KHÔNG BẮT BUỘC khớp chính xác. Thà lệch vài âm tiết còn hơn
+   bịa thêm nội dung hoặc nghe gượng ép.
+
+## Output — JSON list, đúng thứ tự input:
+[{{"i": 0, "vi": "..."}}, ...]
+KHÔNG thêm gì khác ngoài JSON.
+
+## Input
+{input_json}
+"""
+
+def gemini_fix_undershoot(data, client, ratio_threshold=0.85, batch_size=300):
+    """
+    Đối xứng với gemini_fix_overlong: chỉ nhắm đúng các câu dịch NGẮN HƠN
+    ratio_threshold lần so với số âm tiết cho phép (TTS phải đọc chậm/kéo dài
+    bất thường) - yêu cầu Gemini diễn đạt dài ra tự nhiên hơn, kèm ngữ cảnh
+    câu trước/sau lấy động từ chính data của video đang xử lý.
+    """
+    short_idx = []
+    for i, d in enumerate(data):
+        dur = d["end"] - d["start"]
+        allowed = max(round(dur * SYLLABLE_RATE), 1)
+        actual = _count_vi_syllables(d["vi"])
+        if actual < allowed * ratio_threshold:
+            short_idx.append(i)
+
+    if not short_idx:
+        rprint("[green]✅ Không có câu nào bị ngắn quá mức, bỏ qua pass 4[/green]")
+        return data
+
+    rprint(f"[cyan]➕ Pass 4: {len(short_idx)}/{len(data)} câu bị ngắn quá mức, diễn đạt dài ra...[/cyan]")
+    all_vi = {}
+    for bstart in range(0, len(short_idx), batch_size):
+        batch_idx = short_idx[bstart:bstart + batch_size]
+        items = []
+        for idx in batch_idx:
+            d = data[idx]
+            dur = d["end"] - d["start"]
+            allowed = max(round(dur * SYLLABLE_RATE), 1)
+            items.append({
+                "i": idx,
+                "zh": d["zh"],
+                "vi_hien_tai": d["vi"],
+                "duration": round(dur, 2),
+                "allowed_syllables": allowed,
+                "context_before": data[idx - 1]["vi"] if idx - 1 >= 0 else "",
+                "context_after": data[idx + 1]["vi"] if idx + 1 < len(data) else "",
+            })
+        prompt = _FIX_UNDERSHOOT_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
+        for attempt in range(3):
+            try:
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL, contents=prompt,
+                    config=google_genai_types.GenerateContentConfig(response_mime_type="application/json"))
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.text.strip())
+                rows = json.loads(raw)
+                if not isinstance(rows, list):
+                    raise ValueError("Not a list")
+                for row in rows:
+                    if "i" not in row:
+                        continue
+                    vi = row.get("vi", "").strip()
+                    if vi and not _is_refusal(vi):
+                        all_vi[row["i"]] = vi
+                break
+            except Exception as e:
+                rprint(f"[yellow]⚠ Fix-undershoot batch lỗi (lần {attempt+1}): {e}[/yellow]")
+                time.sleep(1.5)
+
+    fixed_count = 0
+    for idx in short_idx:
+        if idx in all_vi:
+            old_syl = _count_vi_syllables(data[idx]["vi"])
+            new_syl = _count_vi_syllables(all_vi[idx])
+            rprint(f"   [{idx+1:03d}] {old_syl}→{new_syl} âm tiết | {all_vi[idx][:50]}")
+            data[idx]["vi"] = all_vi[idx]
+            fixed_count += 1
+    rprint(f"[green]✅ Pass 4 hoàn tất → đã sửa {fixed_count}/{len(short_idx)} câu quá ngắn[/green]")
+    return data
+
 
 def gemini_translate(data, client, is_portrait=False):
     rprint(f"[cyan]📝 Gemini dịch {len(data)} câu (batch={TRANSLATE_BATCH})...[/cyan]")
@@ -421,7 +731,7 @@ def gemini_translate(data, client, is_portrait=False):
                 except Exception as e: rprint(f"   [{i+1:03d}] [!] Mất câu: {e}"); continue
         if not vi.strip(): continue
         result.append({"start":d["start"],"end":d["end"],"zh":d["zh"],"vi":vi})
-        exp=round(dur*3.5)
+        exp=round(dur*SYLLABLE_RATE)
         rprint(f"   [{i+1:03d}] dur={dur:.1f}s exp≥{exp}syl got={all_syl.get(i,'?')}syl | {vi[:50]}")
     if missing:
         rprint(f"[yellow]ℹ {missing}/{len(data)} câu xử lý riêng ({recovered} Gemini, {missing-recovered} GT)[/yellow]")
@@ -450,10 +760,14 @@ def _write_zh_sync(data):
 
 def _write_subtitles(data, is_portrait=False):
     os.makedirs(_OUTPUT_DIR,exist_ok=True); os.makedirs(_AUDIO_DIR,exist_ok=True)
+    # Video dọc (portrait/short) màn hình hẹp -> giữ ngưỡng thấp (42).
+    # Video ngang (landscape) màn hình rộng hơn -> tăng ngưỡng lên 60 để đỡ bị
+    # xuống dòng/cắt không cần thiết với câu dịch tiếng Việt dài hơn gốc.
+    display_max_chars = MAX_DISPLAY_CHARS if is_portrait else 60
     zh_display,vi_display=[],[]
     for d in data:
-        for chunk in _split_sub_for_display(d["zh"],d["start"],d["end"]): zh_display.append(chunk)
-        for chunk in _split_sub_for_display(d["vi"],d["start"],d["end"]): vi_display.append(chunk)
+        for chunk in _split_sub_for_display(d["zh"],d["start"],d["end"],max_chars=display_max_chars): zh_display.append(chunk)
+        for chunk in _split_sub_for_display(d["vi"],d["start"],d["end"],max_chars=display_max_chars): vi_display.append(chunk)
     def _clamp(segs):
         for i in range(len(segs)-1):
             if segs[i]["end"]>segs[i+1]["start"]: segs[i]["end"]=max(segs[i+1]["start"],segs[i]["start"]+0.3)
@@ -464,6 +778,38 @@ def _write_subtitles(data, is_portrait=False):
     rprint(f"   {SRC_SRT_PATH} ({len(zh_display)} entries)")
     rprint(f"   {TRANS_SRT_PATH} ({len(vi_display)} entries)")
     rprint(f"   {SRC_AUDIO_SRT} / {TRANS_AUDIO_SRT} ({len(data)} entries)")
+
+def _merge_short_rows(data, effective_min_dur):
+    """
+    Gộp các câu ngắn hơn effective_min_dur để TTS có đủ thời gian đọc tự nhiên.
+    QUAN TRỌNG: hàm này chỉ được gọi 1 LẦN DUY NHẤT, ngay sau khi dịch xong và
+    TRƯỚC KHI ghi ra file cho user edit - để đảm bảo video sub, file edit, và
+    video dub đều dùng chung đúng 1 bộ dữ liệu đã merge, không lệch pha nhau.
+    """
+    rows = [{"start": d["start"], "end": d["end"], "zh": d["zh"], "vi": d["vi"]} for d in data]
+    i = 0
+    while i < len(rows):
+        dur = rows[i]["end"] - rows[i]["start"]
+        if dur < effective_min_dur:
+            if i + 1 < len(rows):
+                combined = rows[i + 1]["end"] - rows[i]["start"]
+                if combined < effective_min_dur * 2:
+                    rows[i]["vi"] += " " + rows[i + 1]["vi"]
+                    rows[i]["zh"] += " " + rows[i + 1]["zh"]
+                    rows[i]["end"] = rows[i + 1]["end"]
+                    rows.pop(i + 1)
+                    continue
+                else:
+                    rows[i]["end"] = rows[i]["start"] + effective_min_dur
+        i += 1
+    # Câu cuối cùng nếu vẫn quá ngắn (không có câu kế tiếp để gộp xuôi) -> gộp ngược
+    if len(rows) >= 2 and (rows[-1]["end"] - rows[-1]["start"]) < effective_min_dur:
+        rows[-2]["vi"] += " " + rows[-1]["vi"]
+        rows[-2]["zh"] += " " + rows[-1]["zh"]
+        rows[-2]["end"] = rows[-1]["end"]
+        rows.pop()
+    return rows
+
 
 def zh_asr_and_translate(session_id=None):
     rprint("[bold magenta]🚀 ZH Pipeline: ASR + Translate[/bold magenta]")
@@ -512,6 +858,27 @@ def zh_asr_and_translate(session_id=None):
             rprint("[bold cyan]📱 Phát hiện video dọc (portrait/short) -> font sub sẽ tự nhỏ hơn khi burn[/bold cyan]")
         data=gemini_translate(data,client)
         if not data: raise RuntimeError("Gemini không dịch được câu nào")
+
+        # Review pass: xem lại toàn bộ theo timeline, tự lọc watermark/rác +
+        # tinh chỉnh dịch cho tự nhiên/sáng tạo hơn (chạy sau dịch thô lần đầu)
+        data = gemini_review_pass(data, client)
+        if not data: raise RuntimeError("Review pass loại bỏ hết câu, kiểm tra lại OCR/dịch")
+
+        # Pass 3: chỉ sửa riêng các câu dịch quá dài (TTS đọc như tua nhanh)
+        data = gemini_fix_overlong(data, client)
+
+        # Pass 4: chỉ sửa riêng các câu dịch quá ngắn (TTS đọc chậm như rùa bò)
+        data = gemini_fix_undershoot(data, client)
+
+        # Merge câu ngắn NGAY TẠI ĐÂY (1 lần duy nhất), TRƯỚC KHI ghi bất kỳ file
+        # nào (kể cả file cho "video sub") - để video sub và video dub sau này
+        # luôn dùng chung đúng 1 bộ dữ liệu, không lệch pha nhau nữa.
+        min_dur_whisper = _cfg("min_subtitle_duration", 2.5)
+        ocr_min_dur = _cfg("zh_pipeline.ocr_min_subtitle_duration", 1.2)
+        effective_min_dur = ocr_min_dur if subtitle_source == "ocr" else min_dur_whisper
+        data = _merge_short_rows(data, effective_min_dur)
+        rprint(f"[cyan]🔗 Đã gộp câu ngắn (ngưỡng {effective_min_dur}s) → còn {len(data)} câu[/cyan]")
+
         _write_cleaned_chunks(data); _write_zh_sync(data); _write_subtitles(data)
         rprint(f"[bold green]✅ ZH ASR+Translate hoàn tất — {len(data)} câu[/bold green]")
     finally:
@@ -548,31 +915,15 @@ def zh_gen_audio_tasks(session_id=None):
         sync_rows = json.load(f)
     estimator=init_estimator()
     accept=_cfg("speed_factor.accept",1.2); tol_cfg=_cfg("tolerance",1.5)
-    min_dur=_cfg("min_subtitle_duration",2.5); whole_dur=get_audio_duration(_RAW_AUDIO_FILE)
-    subtitle_source = _cfg("subtitle_source", "whisper")
+    whole_dur=get_audio_duration(_RAW_AUDIO_FILE)
+    # KHÔNG merge ở đây nữa - dữ liệu trong ZH_SYNC_JSON đã được merge 1 lần duy nhất
+    # ở bước zh_asr_and_translate (_merge_short_rows), để "video sub" và "video dub"
+    # luôn dùng chung đúng 1 bộ dữ liệu, không lệch pha nhau.
     rows=[]
     for i,r in enumerate(sync_rows):
         rows.append({"number":i+1,"text":r["vi"],"origin":r["zh"],
                      "start_time":_srt_time_dot(r["start"]),"end_time":_srt_time_dot(r["end"]),
                      "duration":round(r["end"]-r["start"],3)})
-    if subtitle_source != "ocr":
-        # Chỉ merge câu ngắn khi dùng Whisper (VAD hay cắt câu vụn).
-        # OCR đọc đúng nhịp sub gốc rồi, ép merge sẽ làm sai lệch hiển thị.
-        i=0
-        while i<len(rows):
-            dur=rows[i]["duration"]
-            if dur<min_dur:
-                if i+1<len(rows):
-                    combined=_parse_dot_time(rows[i+1]["end_time"])-_parse_dot_time(rows[i]["start_time"])
-                    if combined<min_dur*2:
-                        rprint(f"[yellow]Merge row {i+1}+{i+2}[/yellow]")
-                        rows[i]["text"]+=" "+rows[i+1]["text"]; rows[i]["origin"]+=" "+rows[i+1]["origin"]
-                        rows[i]["end_time"]=rows[i+1]["end_time"]; rows[i]["duration"]=combined
-                        rows.pop(i+1); continue
-                    else:
-                        rows[i]["end_time"]=_srt_time_dot(_parse_dot_time(rows[i]["start_time"])+min_dur)
-                        rows[i]["duration"]=min_dur
-            i+=1
     df=pd.DataFrame(rows); n=len(df)
     df["gap"]=0.0
     for i in range(n-1):

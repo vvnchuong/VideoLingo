@@ -6,10 +6,10 @@ display_language: "en"
 api:
   key: 'YOUR_API_KEY'
   keys:
-  - 'YOUR_API_KEY'
-  - 'YOUR_API_KEY'
-  - 'YOUR_API_KEY'
-#  key: 'YOUR_API_KEY'
+  - 'YOUR_API_KEY_1'
+  - 'YOUR_API_KEY_2'
+  - 'YOUR_API_KEY_3'
+#  key: 'YOUR_API_KEY_OLD'
   base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'
 #  base_url: 'https://api.groq.com/openai/v1'
   model: 'gemini-3.1-flash-lite'
@@ -28,8 +28,8 @@ whisper:
   language: 'zh'
   detected_language: 'en'
   runtime: 'local'
-  whisperX_302_api_key: ''
-  elevenlabs_api_key: ''
+  whisperX_302_api_key: 'YOUR_API_KEY'
+  elevenlabs_api_key: 'YOUR_API_KEY'
 
 burn_subtitles: true
 
@@ -56,27 +56,27 @@ pause_before_translate: false
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: ''
+  api_key: 'YOUR_API_KEY'
   voice: 'anna'
   custom_name: ''
   voice_id: ''
   mode: "preset"
 
 openai_tts:
-  api_key: ''
+  api_key: 'YOUR_API_KEY'
   voice: 'alloy'
 
 azure_tts:
-  api_key: ''
+  api_key: 'YOUR_API_KEY'
   voice: 'vi-VN-HoaiMyNeural'
 
 fish_tts:
-  api_key: ''
+  api_key: 'YOUR_API_KEY'
   character: ''
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: ''
+  api_key: 'YOUR_API_KEY'
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -86,7 +86,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: ''
+  302_api: 'YOUR_API_KEY'
 
 speed_factor:
   min: 1
@@ -160,5 +160,7 @@ zh_pipeline:
   portrait_font_size: 10
   # Ngưỡng ký tự để tách 1 câu dịch thành nhiều dòng khi TTS đọc (ưu tiên cắt tại dấu câu/phẩy).
   # Tăng lên nếu thấy TTS bị khựng/ngắt hơi nhiều giữa câu; giảm xuống nếu sub hiện quá dài/trễ so với thoại.
-  tts_split_max_chars: 60
+  tts_split_max_chars: 200
   no_speech_threshold: 0.95
+  ocr_min_subtitle_duration: 1.2
+  syllable_rate: 4.0
