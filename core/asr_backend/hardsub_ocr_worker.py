@@ -9,7 +9,9 @@ Ghi: kết quả JSON {'segments': [...]} ra output_json_path.
 
 import os
 import sys
-
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 def _fix_windows_dll_path():
     if sys.platform != "win32":
@@ -97,7 +99,7 @@ def _init_ocr_engine(lang="ch"):
         lang=lang,
         device="gpu",
         text_detection_model_name="PP-OCRv5_mobile_det",
-        text_recognition_model_name="PP-OCRv5_mobile_rec",
+        text_recognition_model_name="PP-OCRv5_server_rec",
     )
 
 

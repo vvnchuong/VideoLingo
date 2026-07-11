@@ -3,6 +3,7 @@ import time
 import shutil
 import subprocess
 from typing import Tuple
+from core.tts_backend.capcut_tts import synthesize_merged_batch, CapCutTTSError
 
 import pandas as pd
 from pydub import AudioSegment
@@ -73,10 +74,78 @@ def process_row(row: pd.Series, tasks_df: pd.DataFrame) -> Tuple[int, float]:
         real_dur += get_audio_duration(temp_file)
     return number, real_dur
 
+
+def _prefetch_capcut_merged(tasks_df: pd.DataFrame) -> None:
+    from core.tts_backend.capcut_tts_wrapper import DEFAULT_VOICE, DEFAULT_RESOURCE_ID
+    # Gom TOÀN BỘ line trong mọi row thành 1 list phẳng, kèm path đích
+    # ĐÚNG CÔNG THỨC mà process_row() dùng (TEMP_FILE_TEMPLATE.format(f"{number}_{line_index}"))
+    flat_segments = []
+    for _, row in tasks_df.iterrows():
+        number = row['number']
+        lines = eval(row['lines']) if isinstance(row['lines'], str) else row['lines']
+        for line_index, line in enumerate(lines):
+            temp_file = TEMP_FILE_TEMPLATE.format(f"{number}_{line_index}")
+            flat_segments.append({
+                "id": f"{number}_{line_index}",
+                "text": line,
+                "_out_path": temp_file,
+            })
+    rprint(f"[bold cyan]📦 CapCut: gộp {len(flat_segments)} câu thành batch lớn (giảm số request)...[/bold cyan]")
+
+    try:
+        results = synthesize_merged_batch(
+            segments=[{"id": s["id"], "text": s["text"]} for s in flat_segments],
+            voice=DEFAULT_VOICE,
+            resource_id=DEFAULT_RESOURCE_ID,
+            out_dir=_AUDIO_TMP_DIR,  # tạm tải vào đây, sẽ move đúng tên bên dưới
+        )
+
+    except CapCutTTSError as exc:
+        rprint(f"[yellow]⚠️ CapCut merged-batch thất bại, sẽ fallback về gọi từng câu: {exc}[/yellow]")
+        return
+
+    # Map kết quả (path tạm .mp3 do synthesize_merged_batch tạo ra) sang
+
+    # ĐÚNG path .wav mà process_row() mong đợi (TEMP_FILE_TEMPLATE).
+
+    # LƯU Ý QUAN TRỌNG: CapCut trả về .mp3, nhưng TEMP_FILE_TEMPLATE là .wav
+
+    # -> phải CONVERT bằng pydub (đã import sẵn trong file gốc), KHÔNG được
+
+    # shutil.move thẳng vì sẽ tạo file .wav rởm (thực chất là mp3 đổi đuôi),
+
+    # ffmpeg/pydub ở các bước sau (adjust_audio_speed, get_audio_duration)
+
+    # sẽ đọc sai hoặc lỗi.
+
+    result_by_id = {r["id"]: r for r in results if r.get("path")}
+    moved = 0
+    for seg in flat_segments:
+        r = result_by_id.get(seg["id"])
+        if not r:
+            continue  # câu này lỗi trong batch -> để process_row() tự gọi lại sau
+        src_path = r["path"]  # .mp3
+        dst_path = seg["_out_path"]  # .wav
+        if os.path.exists(src_path):
+            try:
+                audio = AudioSegment.from_mp3(src_path)
+                audio.export(dst_path, format="wav")
+                os.remove(src_path)
+                moved += 1
+
+            except Exception as exc:
+                rprint(f"[yellow]⚠️ Lỗi convert mp3->wav cho {seg['id']}: {exc}[/yellow]")
+                continue
+
+    rprint(f"[bold green]✅ CapCut merged-batch: đã tải sẵn {moved}/{len(flat_segments)} câu.[/bold green]")
+
 def generate_tts_audio(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """Generate TTS audio sequentially and calculate actual duration"""
     tasks_df['real_dur'] = 0
     rprint("[bold green]🎯 Starting TTS audio generation...[/bold green]")
+
+    if load_key("tts_method") == "custom_tts":
+        _prefetch_capcut_merged(tasks_df)
     
     with Progress() as progress:
         task = progress.add_task("[cyan]🔄 Generating TTS audio...", total=len(tasks_df))

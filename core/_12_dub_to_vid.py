@@ -83,7 +83,7 @@ def merge_video_audio():
         f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
         f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
         f'{subtitle_filter}[v];'
-        f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3[a]'
+        f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]'
     ]
 
     if load_key("ffmpeg_gpu"):

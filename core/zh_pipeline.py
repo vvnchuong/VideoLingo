@@ -104,7 +104,7 @@ MAX_DISPLAY_CHARS  = 200  # đồng bộ với zh_pipeline.tts_split_max_chars �
 # đúng 3.5 hay làm câu dịch bị cắt cộc lốc. Nâng lên 4.0 (~1.15x) để AI có đất
 # diễn đạt đầy đủ hơn, tự nhiên hơn, đỡ phải cắt bớt ý.
 SYLLABLE_RATE = _cfg("zh_pipeline.syllable_rate", 4.0)
-TRANSLATE_BATCH    = 200  # cân bằng giữa số request và rủi ro bị cắt cụt output (đã set max_output_tokens=65536)
+TRANSLATE_BATCH    = 80  # cân bằng giữa số request và rủi ro bị cắt cụt output (đã set max_output_tokens=65536)
 CONTEXT_TAIL       = 4
 
 # ── VRAM: reload faster-whisper sau mỗi N clips ──────────────────────────────
@@ -415,14 +415,23 @@ duration=3.8s | 为你唱歌 → "Chúng tôi cất cao tiếng hát, gửi tặ
 duration=4.2s | 百年征程 → "Một hành trình dài trăm năm đầy gian nan và vinh quang"
 
 ## Output — JSON list, đúng thứ tự input:
-[{{"i": 0, "vi": "...", "syllables": <số âm tiết>}}, ...]
+[{{"i": 0, "zh_echo": "<copy y nguyên câu \\"zh\\" tương ứng ở input>", "vi": "...", "syllables": <số âm tiết>}}, ...]
+QUAN TRỌNG: "zh_echo" phải copy Y NGUYÊN, KHÔNG sửa đổi, câu "zh" gốc tương
+ứng đúng với "i" đó trong input - dùng để đối chiếu chống lệch thứ tự.
 KHÔNG thêm gì khác ngoài JSON.
 
 ## Input
 {input_json}
 """
 
+def _normalize_for_compare(text):
+    """Bỏ khoảng trắng/dấu câu vụn trước khi so sánh 2 chuỗi tiếng Trung,
+    tránh báo lệch giả do model thêm/bớt dấu cách hoặc dấu câu không đáng kể."""
+    return re.sub(r'[\s\-—.,;:!?…"\'"''、。！？]', '', text)
+
+
 def _gemini_batch(items, client, retries=2, context_block=""):
+    expected_zh = {item["i"]: item["zh"] for item in items}
     prompt=(_TRANSLATE_PROMPT.replace("{context_block}",context_block)
             .replace("{syllable_rate}",str(SYLLABLE_RATE))
             .replace("{input_json}",json.dumps(items,ensure_ascii=False)))
@@ -432,13 +441,23 @@ def _gemini_batch(items, client, retries=2, context_block=""):
             raw=re.sub(r"^```(?:json)?\s*|\s*```$","",resp_text.strip())
             rows=json.loads(raw)
             if not isinstance(rows,list): raise ValueError("Not a list")
-            vi_map,syl_map,refusals={},{},0
+            vi_map,syl_map,refusals,mismatched={},{},0,0
             for row in rows:
                 if "i" not in row: continue
+                idx = row["i"]
+                # Đối chiếu zh_echo với câu gốc THẬT ở đúng vị trí idx - chống
+                # lệch index khi Gemini trả JSON không khớp thứ tự input.
+                expected = expected_zh.get(idx)
+                echo = str(row.get("zh_echo", "")).strip()
+                if expected is not None and echo and _normalize_for_compare(echo) != _normalize_for_compare(expected):
+                    mismatched += 1
+                    rprint(f"[red]⚠ [i={idx}] Lệch index: input='{expected[:30]}' nhưng Gemini echo='{echo[:30]}' -> bỏ qua[/red]")
+                    continue
                 vi=row.get("vi","").strip()
                 if _is_refusal(vi): refusals+=1; continue
-                vi_map[row["i"]]=vi; syl_map[row["i"]]=row.get("syllables","?")
+                vi_map[idx]=vi; syl_map[idx]=row.get("syllables","?")
             if refusals: rprint(f"[yellow]⚠ Gemini từ chối {refusals} câu[/yellow]")
+            if mismatched: rprint(f"[red]⚠ {mismatched} câu bị lệch index, đã loại bỏ (sẽ xử lý riêng)[/red]")
             return vi_map,syl_map
         except Exception as e:
             rprint(f"[yellow]⚠ Gemini batch lỗi (lần {attempt+1}): {e}[/yellow]"); time.sleep(1.5)
