@@ -4,7 +4,7 @@ display_language: "en"
 
 # API settings
 api:
-  key: 'YOUR_API_KEY'
+  key: 'YOUR_API_KEY_HERE'
   keys:
   - 'YOUR_API_KEY_1'
   - 'YOUR_API_KEY_2'
@@ -23,13 +23,14 @@ subtitle_source: 'ocr'
 
 demucs: false
 
+ocr_region:
 whisper:
   model: 'medium'
   language: 'zh'
   detected_language: 'en'
   runtime: 'local'
-  whisperX_302_api_key: 'YOUR_API_KEY'
-  elevenlabs_api_key: 'YOUR_API_KEY'
+  whisperX_302_api_key: ''
+  elevenlabs_api_key: ''
 
 burn_subtitles: true
 
@@ -56,27 +57,27 @@ pause_before_translate: false
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: 'YOUR_API_KEY'
+  api_key: ''
   voice: 'anna'
   custom_name: ''
   voice_id: ''
   mode: "preset"
 
 openai_tts:
-  api_key: 'YOUR_API_KEY'
+  api_key: ''
   voice: 'alloy'
 
 azure_tts:
-  api_key: 'YOUR_API_KEY'
+  api_key: ''
   voice: 'vi-VN-HoaiMyNeural'
 
 fish_tts:
-  api_key: 'YOUR_API_KEY'
+  api_key: ''
   character: ''
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: 'YOUR_API_KEY'
+  api_key: ''
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -86,7 +87,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: 'YOUR_API_KEY'
+  302_api: ''
 
 speed_factor:
   min: 1
@@ -151,7 +152,7 @@ vieneu:
 # Bypass hoàn toàn WhisperX alignment (wav2vec2-zh hay fail) + spaCy ZH split
 
 zh_pipeline:
-  gemini_api_key: 'YOUR_API_KEY'
+  gemini_api_key: 'YOUR_GEMINI_API_KEY_1, YOUR_GEMINI_API_KEY_2'
   gemini_model: 'gemini-3.1-flash-lite'
   whisper_model_zh: 'medium'
   demucs_for_vad: true
@@ -160,7 +161,10 @@ zh_pipeline:
   portrait_font_size: 10
   # Ngưỡng ký tự để tách 1 câu dịch thành nhiều dòng khi TTS đọc (ưu tiên cắt tại dấu câu/phẩy).
   # Tăng lên nếu thấy TTS bị khựng/ngắt hơi nhiều giữa câu; giảm xuống nếu sub hiện quá dài/trễ so với thoại.
-  tts_split_max_chars: 200
+  tts_split_max_chars: 42 # dung sub do nghe duoc nen de nho lai, tranh tran sub
+  ocr_tts_split_max_chars: 200 # ocr dung sub trong video nen de cao cho thoang
   no_speech_threshold: 0.95
-  ocr_min_subtitle_duration: 1.2
+  ocr_min_subtitle_duration: 0.8
   syllable_rate: 4.0
+  merge_min_zh_duration: 1.2   # đoạn ngắn hơn 1.2s sẽ được xét gộp
+  merge_max_zh_gap: 0.5        # chỉ gộp nếu khoảng lặng giữa 2 đoạn < 0.5s

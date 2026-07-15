@@ -37,7 +37,7 @@ import json
 import cv2
 from difflib import SequenceMatcher
 
-CROP_TOP_RATIO = 0.75
+CROP_TOP_RATIO = 0.75  # fallback khi không có vùng quét tuỳ chỉnh (giữ tương thích ngược)
 SAMPLE_INTERVAL_SEC = 0.2  # giảm từ 0.5 xuống 0.2 để bắt đúng thời điểm sub xuất hiện,
                             # tránh trễ tới ~1s do lấy mẫu quá thưa (đổi lại OCR chạy lâu hơn ~2.5x)
 SIMILARITY_THRESHOLD = 0.6
@@ -103,13 +103,76 @@ def _init_ocr_engine(lang="ch"):
     )
 
 
-def _ocr_frame(ocr_engine, frame):
+# def _ocr_frame(ocr_engine, frame, region=None):
+#     """
+#     region: dict {top, bottom, left, right} dạng tỉ lệ 0.0-1.0, hoặc None để dùng
+#     fallback CROP_TOP_RATIO cũ (quét full chiều ngang, từ CROP_TOP_RATIO xuống đáy).
+#     """
+#     h, w = frame.shape[:2]
+#     if region:
+#         y1 = int(h * region["top"])
+#         y2 = int(h * region["bottom"])
+#         x1 = int(w * region["left"])
+#         x2 = int(w * region["right"])
+#
+#         region_h = y2 - y1
+#         pad_ratio = int(region_h * 0.25)
+#         pad_min = 20
+#         pad = max(pad_ratio, pad_min)
+#         y1 = max(0, y1 - pad)
+#         y2 = min(h, y2 + pad)
+#
+#         crop = frame[y1:y2, x1:x2]
+#     else:
+#         crop = frame[int(h * CROP_TOP_RATIO):h, 0:w]
+#
+#     ch, cw = crop.shape[:2]
+#     if cw > MAX_OCR_WIDTH:
+#         scale = MAX_OCR_WIDTH / cw
+#         crop = cv2.resize(crop, (MAX_OCR_WIDTH, int(ch * scale)))
+#     result = ocr_engine.predict(crop)
+#     if not result:
+#         return ""
+#     texts = []
+#     for res in result:
+#         texts.extend(res.get("rec_texts", []))
+#     return " ".join(texts).strip()
+
+def _compute_padded_crop(frame, region, pad_ratio_val, pad_min_val):
+    """Tính vùng crop đã pad, tự bù sang phía không bị chặn nếu 1 phía chạm biên frame."""
     h, w = frame.shape[:2]
-    crop = frame[int(h * CROP_TOP_RATIO):h, 0:w]
+    y1 = int(h * region["top"])
+    y2 = int(h * region["bottom"])
+    x1 = int(w * region["left"])
+    x2 = int(w * region["right"])
+
+    region_h = y2 - y1
+    pad = max(int(region_h * pad_ratio_val), pad_min_val)
+
+    new_y1 = max(0, y1 - pad)
+    new_y2 = min(h, y2 + pad)
+
+    actual_pad_top = y1 - new_y1
+    actual_pad_bottom = new_y2 - y2
+    deficit = (pad - actual_pad_top) + (pad - actual_pad_bottom)
+    if deficit > 0:
+        if actual_pad_bottom < pad:
+            new_y1 = max(0, new_y1 - deficit)
+        elif actual_pad_top < pad:
+            new_y2 = min(h, new_y2 + deficit)
+
+    return frame[new_y1:new_y2, x1:x2]
+
+
+def _resize_for_ocr(crop):
     ch, cw = crop.shape[:2]
     if cw > MAX_OCR_WIDTH:
         scale = MAX_OCR_WIDTH / cw
         crop = cv2.resize(crop, (MAX_OCR_WIDTH, int(ch * scale)))
+    return crop
+
+
+def _run_ocr(ocr_engine, crop):
     result = ocr_engine.predict(crop)
     if not result:
         return ""
@@ -119,8 +182,34 @@ def _ocr_frame(ocr_engine, frame):
     return " ".join(texts).strip()
 
 
-def extract_hardsub(video_path, lang="ch"):
+def _ocr_frame(ocr_engine, frame, region=None):
+    """
+    region: dict {top, bottom, left, right} dạng tỉ lệ 0.0-1.0, hoặc None để dùng
+    fallback CROP_TOP_RATIO cũ (quét full chiều ngang, từ CROP_TOP_RATIO xuống đáy).
+
+    Khi có region: pad thêm biên trên/dưới trước khi đưa vào OCR, vì PaddleOCR
+    (PP-OCRv5 detection) hay bỏ sót text khi ảnh crop quá sát/khít vào chữ, đặc
+    biệt khi vùng crop rất mỏng (ratio width/height quá lớn). Nếu lần đầu (pad nhẹ)
+    vẫn không đọc được gì, retry với pad rộng hơn trước khi chấp nhận bỏ trống.
+    """
+    h, w = frame.shape[:2]
+    if region:
+        crop = _compute_padded_crop(frame, region, pad_ratio_val=0.3125, pad_min_val=60)
+        text = _run_ocr(ocr_engine, crop)
+        if not text:
+            crop = _compute_padded_crop(frame, region, pad_ratio_val=0.6, pad_min_val=120)
+            text = _run_ocr(ocr_engine, crop)
+        return text
+    else:
+        crop = frame[int(h * CROP_TOP_RATIO):h, 0:w]
+        crop = _resize_for_ocr(crop)
+        return _run_ocr(ocr_engine, crop)
+
+
+def extract_hardsub(video_path, lang="ch", region=None):
     print(f"[OCR-worker] Bắt đầu đọc hardsub từ: {video_path}", flush=True)
+    if region:
+        print(f"[OCR-worker] Dùng vùng quét tuỳ chỉnh: {region}", flush=True)
     ocr_engine = _init_ocr_engine(lang)
     fps, frame_count = _get_video_fps_and_frame_count(video_path)
     frame_interval = max(1, int(fps * SAMPLE_INTERVAL_SEC))
@@ -136,7 +225,7 @@ def extract_hardsub(video_path, lang="ch"):
             break
         if frame_idx % frame_interval == 0:
             timestamp = frame_idx / fps
-            text = _ocr_frame(ocr_engine, frame)
+            text = _ocr_frame(ocr_engine, frame, region)
             raw_entries.append((timestamp, text))
             if frame_idx % (frame_interval * 20) == 0:
                 print(f"[OCR-worker] {timestamp:.1f}s / {total_duration:.1f}s...", flush=True)
@@ -189,7 +278,12 @@ if __name__ == "__main__":
     video_path = sys.argv[1]
     output_json_path = sys.argv[2]
     lang = sys.argv[3] if len(sys.argv) > 3 else "ch"
-    result = extract_hardsub(video_path, lang)
+    # region truyền vào dạng JSON string: '{"top":0.6,"bottom":0.8,"left":0.1,"right":0.9}'
+    # rỗng/không truyền thì None -> dùng fallback CROP_TOP_RATIO cũ.
+    region = None
+    if len(sys.argv) > 4 and sys.argv[4]:
+        region = json.loads(sys.argv[4])
+    result = extract_hardsub(video_path, lang, region)
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"[OCR-worker] Đã ghi kết quả vào {output_json_path}", flush=True)

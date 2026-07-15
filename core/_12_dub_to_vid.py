@@ -71,7 +71,8 @@ def merge_video_audio():
         rprint(f"[bold cyan]Video dọc (portrait) -> giảm font sub còn {trans_font_size}[/bold cyan]")
 
     subtitle_filter = (
-        f"subtitles={DUB_SUB_FILE}:force_style='FontSize={trans_font_size},"
+        f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
+        f"force_style='FontSize={trans_font_size},"
         f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
         f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
         f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"

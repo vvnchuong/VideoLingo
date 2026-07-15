@@ -72,7 +72,13 @@ with sync_playwright() as p:
         except: pass
 
     page.on("response", on_response)
-    page.goto("https://www.douyin.com/video/{aweme_id}")
+    # wait_until mặc định là "load" - chờ TOÀN BỘ trang load xong (kể cả ảnh, video,
+    # script quảng cáo/theo dõi phụ) - Douyin thường không bao giờ đạt trạng thái này
+    # trong 30s do quá nhiều tài nguyên phụ, gây timeout dù dữ liệu cần lấy (link video
+    # thật) đã đến qua network response bắt ở on_response() từ rất sớm rồi.
+    # "domcontentloaded" chỉ cần HTML+DOM dựng xong, nhanh hơn nhiều và đủ dùng vì
+    # phần lấy dữ liệu thật không phụ thuộc goto() có "load xong" theo đúng nghĩa hay không.
+    page.goto("https://www.douyin.com/video/{aweme_id}", wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(7000)
     cookies = context.cookies()
     cookie_str = "; ".join(f"{{c['name']}}={{c['value']}}" for c in cookies)
@@ -90,7 +96,9 @@ print(json.dumps({{"dl_url": dl_url, "title": title, "cookie_str": cookie_str}})
             capture_output=True, text=True, timeout=60
         )
         if result.returncode != 0:
-            raise RuntimeError(f"Playwright subprocess lỗi: {result.stderr[:300]}")
+            # Bỏ cắt [:300] - log cụt mất phần quan trọng nhất (dòng lỗi thật của
+            # Playwright thường nằm ở CUỐI traceback), khó biết đang lỗi gì để sửa.
+            raise RuntimeError(f"Playwright subprocess lỗi:\n{result.stderr}")
         data = json.loads(result.stdout.strip())
         return data["dl_url"], data["title"], data["cookie_str"]
     finally:

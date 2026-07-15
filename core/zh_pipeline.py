@@ -792,13 +792,13 @@ def gemini_translate(data, client, is_portrait=False):
     result,missing,recovered=[],0,0
     for i,d in enumerate(data):
         vi=all_vi.get(i,"").strip(); dur=d["end"]-d["start"]
-        if not vi:
-            missing+=1; vi=_gemini_single(d["zh"],dur,client)
-            if vi: recovered+=1
-            else:
-                try: vi=GoogleTranslator(source="zh-CN",target="vi").translate(d["zh"]) or ""
-                except Exception as e: rprint(f"   [{i+1:03d}] [!] Mất câu: {e}"); continue
-        if not vi.strip(): continue
+        # if not vi:
+        #     missing+=1; vi=_gemini_single(d["zh"],dur,client)
+        #     if vi: recovered+=1
+        #     else:
+        #         try: vi=GoogleTranslator(source="zh-CN",target="vi").translate(d["zh"]) or ""
+        #         except Exception as e: rprint(f"   [{i+1:03d}] [!] Mất câu: {e}"); continue
+        # if not vi.strip(): continue
         result.append({"start":d["start"],"end":d["end"],"zh":d["zh"],"vi":vi})
         exp=round(dur*SYLLABLE_RATE)
         rprint(f"   [{i+1:03d}] dur={dur:.1f}s exp≥{exp}syl got={all_syl.get(i,'?')}syl | {vi[:50]}")
@@ -903,7 +903,8 @@ def zh_asr_and_translate(session_id=None):
             # ── Nhánh OCR: đọc sub cứng có sẵn, bỏ qua VAD + Whisper ──────────
             from core.asr_backend.hardsub_ocr import extract_hardsub
             rprint("[cyan]🔎 Đọc phụ đề cứng (hardsub) bằng OCR...[/cyan]")
-            ocr_result = extract_hardsub(video_path, lang="ch")
+            ocr_region = _cfg("ocr_region", None)  # ← dòng MỚI thêm
+            ocr_result = extract_hardsub(video_path, lang="ch", region=ocr_region)  # ← đổi từ extract_hardsub(video_path, lang="ch")
             raw_segments = ocr_result.get("segments", [])
             data = [
                 {"start": seg["start"], "end": seg["end"], "zh": seg["text"].strip()}
@@ -943,7 +944,7 @@ def zh_asr_and_translate(session_id=None):
         # nào (kể cả file cho "video sub") - để video sub và video dub sau này
         # luôn dùng chung đúng 1 bộ dữ liệu, không lệch pha nhau nữa.
         min_dur_whisper = _cfg("min_subtitle_duration", 2.5)
-        ocr_min_dur = _cfg("zh_pipeline.ocr_min_subtitle_duration", 1.2)
+        ocr_min_dur = _cfg("zh_pipeline.ocr_min_subtitle_duration", 0.8)
         effective_min_dur = ocr_min_dur if subtitle_source == "ocr" else min_dur_whisper
         data = _merge_short_rows(data, effective_min_dur)
         rprint(f"[cyan]🔗 Đã gộp câu ngắn (ngưỡng {effective_min_dur}s) → còn {len(data)} câu[/cyan]")
@@ -1009,7 +1010,14 @@ def zh_gen_audio_tasks(session_id=None):
         else: return 0
     df["if_too_fast"]=df.apply(_if_too_fast,axis=1)
     df["cut_off"]=1
-    tts_max_chars = _cfg("zh_pipeline.tts_split_max_chars", 60)
+    # Tách riêng ngưỡng cắt dòng theo nguồn phụ đề - KHÔNG dùng chung 1 config
+    # để tránh sửa OCR ảnh hưởng ngược lại Whisper (và ngược lại). Nhánh
+    # Whisper giữ NGUYÊN key cũ + default cũ, không đổi gì cả.
+    subtitle_source = _cfg("subtitle_source", "whisper")
+    if subtitle_source == "ocr":
+        tts_max_chars = _cfg("zh_pipeline.ocr_tts_split_max_chars", 42)
+    else:
+        tts_max_chars = _cfg("zh_pipeline.tts_split_max_chars", 60)
     df["lines"]=df["text"].apply(lambda t:_split_text_for_sub(str(t), max_chars=tts_max_chars))
     df["src_lines"]=df["origin"].apply(lambda t:[str(t)])
     df["real_dur"]=0.0; df["new_sub_times"]=None

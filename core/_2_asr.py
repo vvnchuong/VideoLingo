@@ -17,7 +17,15 @@ def transcribe():
         rprint("[cyan]🔎 Đọc phụ đề cứng (hardsub) bằng OCR...[/cyan]")
         ocr_lang_map = {"zh": "ch", "en": "en", "ja": "japan", "ko": "korean"}
         ocr_lang = ocr_lang_map.get(load_key("whisper.language"), "ch")
-        combined_result = extract_hardsub(video_file, lang=ocr_lang)
+        # Vùng quét do người dùng tự kéo khung chọn trên UI, set qua run_job.py
+        # (key "ocr_region" trong config.yaml, dạng {top,bottom,left,right} tỉ lệ 0-1).
+        # load_key() raise KeyError nếu key chưa tồn tại (job whisper thường không có key
+        # này) nên phải try/except, không được gọi thẳng như các load_key khác.
+        try:
+            ocr_region = load_key("ocr_region")
+        except KeyError:
+            ocr_region = None
+        combined_result = extract_hardsub(video_file, lang=ocr_lang, region=ocr_region)
         df = process_transcription(combined_result)
         save_results(df)
         return

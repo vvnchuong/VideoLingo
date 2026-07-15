@@ -29,10 +29,12 @@ def _get_ocr_python_executable():
     return sys.executable
 
 
-def extract_hardsub(video_path, lang="ch"):
+def extract_hardsub(video_path, lang="ch", region=None):
     """
     Đọc sub cứng trong video bằng cách chạy worker OCR trong process con riêng,
     dùng venv riêng (.venv_ocr) để tránh xung đột DLL torch<->paddle.
+    region: dict {top, bottom, left, right} dạng tỉ lệ 0.0-1.0, None = quét theo
+    fallback mặc định (CROP_TOP_RATIO trong worker).
     Trả về {'segments': [{'start', 'end', 'text'}, ...]}
     """
     worker_path = os.path.join(os.path.dirname(__file__), "hardsub_ocr_worker.py")
@@ -43,6 +45,8 @@ def extract_hardsub(video_path, lang="ch"):
 
     try:
         cmd = [python_exe, worker_path, video_path, output_json_path, lang]
+        if region:
+            cmd.append(json.dumps(region))
         print(f"[OCR] Chạy worker process: {' '.join(cmd)}")
         process = subprocess.run(cmd, capture_output=False, text=True)
 
