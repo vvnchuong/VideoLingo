@@ -7,6 +7,7 @@ lock = threading.Lock()
 yaml = YAML()
 yaml.preserve_quotes = True
 
+
 # -----------------------
 # load & update config
 # -----------------------
@@ -24,6 +25,7 @@ def load_key(key):
         else:
             raise KeyError(f"Key '{k}' not found in configuration")
     return value
+
 
 def update_key(key, new_value):
     with lock:
@@ -45,7 +47,8 @@ def update_key(key, new_value):
             return True
         else:
             raise KeyError(f"Key '{keys[-1]}' not found in configuration")
-        
+
+
 # basic utils
 def get_joiner(language):
     if language in load_key('language_split_with_space'):
@@ -54,6 +57,23 @@ def get_joiner(language):
         return ""
     else:
         raise ValueError(f"Unsupported language code: {language}")
+
+
+_DEFAULT_SUB_MARGIN_V = 27
+_MIN_SUB_MARGIN_V = 5
+_GAP_BELOW_CROP_PX = 8
+
+
+def compute_sub_margin_v(target_height: int) -> int:
+    ocr_region = load_key("ocr_region")
+    if not ocr_region or ocr_region.get("bottom") is None:
+        return _DEFAULT_SUB_MARGIN_V
+
+    space_below_crop_px = (1 - ocr_region["bottom"]) * target_height
+    margin_v = space_below_crop_px - _GAP_BELOW_CROP_PX
+
+    return int(max(_MIN_SUB_MARGIN_V, min(_DEFAULT_SUB_MARGIN_V, margin_v)))
+
 
 if __name__ == "__main__":
     print(load_key('language_split_with_space'))

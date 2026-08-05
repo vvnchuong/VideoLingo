@@ -1,10 +1,6 @@
 import os, sys, re, glob, subprocess, asyncio, requests
 from core.utils import *
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
 def sanitize_filename(filename):
     filename = filename.replace('\n', ' ').replace('\r', ' ')
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1f#]', '', filename)
@@ -41,25 +37,35 @@ def _douyin_extract_id(url: str):
             return m.group(1)
     return None
 
-def _douyin_get_direct_url(aweme_id: str):
-    """Chạy Playwright trong subprocess riêng — tránh conflict event loop với Streamlit."""
+def _douyin_get_direct_url_attempt(aweme_id: str):
     import json, tempfile, sys
+    debug_dir = os.path.join(tempfile.gettempdir(), "douyin_debug")
+    os.makedirs(debug_dir, exist_ok=True)
     script = f"""
 import json, sys
 from playwright.sync_api import sync_playwright
 
 dl_url, title, cookie_str = None, "{aweme_id}", ""
+matched_response_seen = False
+matched_response_status = None
+matched_response_body_snippet = None
+response_count = 0
+
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     context = browser.new_context()
     page = context.new_page()
 
     def on_response(response):
-        global dl_url, title
-        if dl_url: return
+        global dl_url, title, matched_response_seen, matched_response_status, matched_response_body_snippet, response_count
+        response_count += 1
         if "aweme/v1/web/aweme/detail" not in response.url: return
+        matched_response_seen = True
+        matched_response_status = response.status
+        if dl_url: return
         try:
             data = response.json()
+            matched_response_body_snippet = json.dumps(data)[:500]
             detail = data.get("aweme_detail", {{}})
             title = detail.get("desc", "{aweme_id}")[:80]
             video = detail.get("video", {{}})
@@ -69,19 +75,32 @@ with sync_playwright() as p:
                 if "douyin.com" in u or "tiktokv.com" in u:
                     dl_url = u; return
             if urls: dl_url = urls[0]
-        except: pass
+        except Exception as e:
+            matched_response_body_snippet = f"LỖI parse JSON: {{e}}"
 
     page.on("response", on_response)
-    # wait_until mặc định là "load" - chờ TOÀN BỘ trang load xong (kể cả ảnh, video,
-    # script quảng cáo/theo dõi phụ) - Douyin thường không bao giờ đạt trạng thái này
-    # trong 30s do quá nhiều tài nguyên phụ, gây timeout dù dữ liệu cần lấy (link video
-    # thật) đã đến qua network response bắt ở on_response() từ rất sớm rồi.
-    # "domcontentloaded" chỉ cần HTML+DOM dựng xong, nhanh hơn nhiều và đủ dùng vì
-    # phần lấy dữ liệu thật không phụ thuộc goto() có "load xong" theo đúng nghĩa hay không.
     page.goto("https://www.douyin.com/video/{aweme_id}", wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(7000)
     cookies = context.cookies()
     cookie_str = "; ".join(f"{{c['name']}}={{c['value']}}" for c in cookies)
+
+    # ── DEBUG: luôn lưu lại bằng chứng để so sánh giữa lần gọi Streamlit vs
+    # React - chụp màn hình + url cuối cùng trình duyệt đang đứng (có thể bị
+    # Douyin redirect sang trang captcha/chặn khác hẳn URL gốc) + có bắt được
+    # đúng response API mong đợi hay không (tách biệt với việc parse ra dl_url
+    # có thành công hay không - 2 vấn đề khác nhau).
+    debug_info = {{
+        "final_page_url": page.url,
+        "response_count_total": response_count,
+        "matched_response_seen": matched_response_seen,
+        "matched_response_status": matched_response_status,
+        "matched_response_body_snippet": matched_response_body_snippet,
+        "dl_url_extracted": dl_url,
+    }}
+    with open(r"{debug_dir}\\{aweme_id}_debug.json", "w", encoding="utf-8") as f:
+        json.dump(debug_info, f, ensure_ascii=False, indent=2)
+    page.screenshot(path=r"{debug_dir}\\{aweme_id}_screenshot.png", full_page=True)
+
     browser.close()
 
 print(json.dumps({{"dl_url": dl_url, "title": title, "cookie_str": cookie_str}}))
@@ -93,16 +112,31 @@ print(json.dumps({{"dl_url": dl_url, "title": title, "cookie_str": cookie_str}})
     try:
         result = subprocess.run(
             [sys.executable, tmp.name],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=90
         )
         if result.returncode != 0:
-            # Bỏ cắt [:300] - log cụt mất phần quan trọng nhất (dòng lỗi thật của
-            # Playwright thường nằm ở CUỐI traceback), khó biết đang lỗi gì để sửa.
             raise RuntimeError(f"Playwright subprocess lỗi:\n{result.stderr}")
         data = json.loads(result.stdout.strip())
         return data["dl_url"], data["title"], data["cookie_str"]
     finally:
         os.unlink(tmp.name)
+
+
+def _douyin_get_direct_url(aweme_id: str, max_attempts: int = 3):
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            dl_url, title, cookie_str = _douyin_get_direct_url_attempt(aweme_id)
+            if dl_url:
+                return dl_url, title, cookie_str
+            print(f"[Douyin] Lần thử {attempt}/{max_attempts} không lấy được dl_url, thử lại...")
+        except Exception as e:
+            last_error = e
+            print(f"[Douyin] Lần thử {attempt}/{max_attempts} lỗi: {e}, thử lại...")
+
+    if last_error:
+        raise last_error
+    return None, aweme_id, ""
 
 def _douyin_download_file(dl_url: str, cookie_str: str, save_path: str, aweme_id: str, title: str):
     """Download file mp4 từ direct URL."""
@@ -147,11 +181,6 @@ def download_douyin(url: str, save_path: str = 'output'):
         raise RuntimeError(f"Không lấy được download URL cho video {aweme_id}")
 
     return _douyin_download_file(dl_url, cookie_str, save_path, aweme_id, title)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN — tự detect Douyin vs các platform khác
-# ══════════════════════════════════════════════════════════════════════════════
 
 def download_video_ytdlp(url, save_path='output', resolution='1080'):
     # Douyin → dùng Playwright

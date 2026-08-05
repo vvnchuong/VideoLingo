@@ -1,25 +1,3 @@
-"""
-run_job.py - chạy pipeline VideoLingo KHÔNG qua Streamlit, để Java ProcessBuilder gọi.
-
-Mô phỏng lại đúng thứ tự các bước _get_text_steps() / _get_audio_steps() trong st.py,
-KHÔNG import st.py (tránh streamlit tự chạy code UI lúc import).
-
-Cách chạy (đứng tại thư mục gốc VideoLingo, cùng chỗ chứa st.py):
-    python run_job.py --input "D:/aidubbing-uploads/xxx.mp4" --output "D:/aidubbing-results/job_1.mp4"
-
-Exit code:
-    0  = thành công, in ra đúng 1 dòng cuối "RESULT_PATH=<đường dẫn file kết quả>"
-    1  = lỗi, in traceback ra stderr
-
-LƯU Ý QUAN TRỌNG (đọc trước khi dùng thật):
-- Script này CHỈ ĐƯỢC chạy 1 job tại 1 thời điểm (bị giới hạn bởi thư mục output/ dùng chung
-  và VRAM GPU chỉ đủ 1 job) - phía Java (JobPollerScheduler) phải đảm bảo không gọi song song.
-- Mình copy lại đúng logic branch ZH/EN từ st.py hiện tại - NẾU BẠN SỬA st.py SAU NÀY
-  (thêm bước, đổi thứ tự...), PHẢI SỬA LẠI FILE NÀY THEO, không tự đồng bộ.
-- Chưa test thật với dữ liệu ZH pipeline - bạn cần tự chạy thử, đối chiếu kỹ với luồng
-  Streamlit đã chạy ổn, trước khi cho chạy tự động qua Java.
-"""
-
 import argparse
 import json
 import os
@@ -36,7 +14,6 @@ def _configure_utf8_console():
 
 _configure_utf8_console()
 
-# Đứng đúng tại thư mục gốc VideoLingo khi chạy script này (giống cách st.py giả định)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.environ["PATH"] += os.pathsep + current_dir
 sys.path.append(current_dir)
@@ -72,7 +49,6 @@ def _get_source_language():
 
 
 def _build_text_steps():
-    """Copy nguyên logic từ st.py::_get_text_steps() - KHÔNG import st.py."""
     lang = _get_source_language()
 
     if lang == "zh":
@@ -101,7 +77,6 @@ def _build_text_steps():
 
 
 def _build_audio_steps():
-    """Copy nguyên logic từ st.py::_get_audio_steps() - KHÔNG import st.py."""
     lang = _get_source_language()
 
     if lang == "zh":
@@ -133,11 +108,6 @@ def _run_steps(steps):
 
 
 def _prepare_output_dir(input_video_path: str):
-    """
-    Dọn sạch output/ trước khi chạy job mới, tránh dính file cũ (từ lần test Streamlit
-    trước, hoặc job trước đó) làm lệch dữ liệu - đúng nỗi lo "ZH/EN file count lệch"
-    đã gặp trước đây.
-    """
     if os.path.exists(OUTPUT_DIR):
         shutil.rmtree(OUTPUT_DIR)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -190,8 +160,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Ghi đè config.yaml theo đúng lựa chọn của job này TRƯỚC khi build steps -
-    # _build_text_steps()/_build_audio_steps() đọc config qua load_key() nên phải set trước.
     print(
         f"[DEBUG] source_lang='{args.source_lang}' subtitle_source='{args.subtitle_source}' "
         f"voice_id='{args.voice_id}' ocr_top='{args.ocr_top}' ocr_bottom='{args.ocr_bottom}' "
@@ -207,18 +175,8 @@ def main():
         update_key("subtitle_source", args.subtitle_source)
         print(f"[DEBUG] Đã ghi subtitle_source = {args.subtitle_source} vào config.yaml", flush=True)
     if args.voice_id:
-        # CapCut TTS chọn giọng qua biến môi trường (đọc trong core/tts_backend/custom_tts.py),
-        # KHÔNG qua config.yaml, vì ACTIVE_VOICE là hằng số cấp module trong capcut_tts_wrapper.py.
-        os.environ["CAPCUT_VOICE_PRESET"] = args.voice_id
+        os.environ["DUB_VOICE_ID"] = args.voice_id
 
-    # 4 số riêng thay vì 1 chuỗi JSON qua CLI - vì Windows tự ý "sửa" dấu ngoặc kép
-    # khi ProcessBuilder dựng command line, làm hỏng JSON truyền qua argv (lỗi thật
-    # đã gặp: JSONDecodeError "Expecting property name enclosed in double quotes").
-    # Dựng lại dict ngay trong Python, không parse JSON qua biên CLI nữa.
-    # LUÔN ghi (kể cả rỗng -> None) chứ không "if ...:" như source_lang/subtitle_source -
-    # vì bước dub/sub-only sau này gọi lại merge_subtitles_to_video(), nếu job hiện tại
-    # không dùng OCR mà không xoá key cũ thì sẽ vô tình che nhầm video của job này bằng
-    # toạ độ của job OCR trước đó (dùng chung 1 config.yaml, không tách theo từng job).
     if args.ocr_top and args.ocr_bottom and args.ocr_left and args.ocr_right:
         ocr_region = {
             "top": float(args.ocr_top),
@@ -250,15 +208,9 @@ def main():
             sys.exit(0)
 
         if args.stage == "dub":
-            # KHÔNG gọi _prepare_output_dir() - dùng đúng output/ đang có sẵn
-            # (đã được Java copy từ workDir vào trước khi gọi lệnh này)
             if not args.output:
                 raise ValueError("--stage dub cần --output")
 
-            # QUAN TRỌNG: user có thể đã sửa trans.srt ở bước sub-edit. Streamlit xử lý
-            # y hệt: gọi lại merge_subtitles_to_video() để render lại hình ảnh sub trên
-            # video với nội dung mới, TRƯỚC KHI chạy tiếp audio/dub - xem
-            # core/st_utils/edit_sub_section.py, nút "Re-render preview".
             print("[STEP] Re-render subtitle into video with edited translation", flush=True)
             _7_sub_into_vid.merge_subtitles_to_video()
 
@@ -267,10 +219,6 @@ def main():
             sys.exit(0)
 
         if args.stage == "sub-only":
-            # Dành cho người chỉ cần video có sub cứng, KHÔNG cần ghép giọng lồng tiếng.
-            # Giống bước đầu của "dub" ở chỗ re-render sub theo bản edit mới nhất,
-            # nhưng KHÔNG chạy _build_audio_steps() (bỏ qua toàn bộ TTS/ghép audio),
-            # nên nhanh hơn nhiều và không tốn quota TTS.
             if not args.output:
                 raise ValueError("--stage sub-only cần --output")
 
@@ -280,7 +228,6 @@ def main():
             _finalize_sub_only_result(args.output)
             sys.exit(0)
 
-        # stage == "all" - giữ nguyên hành vi cũ, chạy hết 1 mạch
         if not args.input or not args.output:
             raise ValueError("--stage all cần cả --input và --output")
         _prepare_output_dir(args.input)
@@ -305,10 +252,6 @@ def _finalize_result(output_path: str):
 
 
 def _finalize_sub_only_result(output_path: str):
-    # Cố tình CHỈ lấy SUB_VIDEO, không dùng logic "ưu tiên DUB_VIDEO nếu có" như
-    # _finalize_result() - vì đây là mode sub-only, nếu output/ lỡ còn sót
-    # output_dub.mp4 từ lần chạy trước (workDir bị tái sử dụng nhầm) thì thà báo lỗi
-    # rõ ràng còn hơn âm thầm trả nhầm video có giọng dub cho người chỉ muốn video sub.
     if not os.path.exists(SUB_VIDEO):
         raise RuntimeError(f"Pipeline chạy xong nhưng không thấy file kết quả tại {SUB_VIDEO}")
 

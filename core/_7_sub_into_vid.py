@@ -33,6 +33,83 @@ OUTPUT_VIDEO = f"{OUTPUT_DIR}/output_sub.mp4"
 SRC_SRT = f"{OUTPUT_DIR}/src.srt"
 TRANS_SRT = f"{OUTPUT_DIR}/trans.srt"
 
+def _compute_safe_blur_strength(crop_w: int, crop_h: int) -> str:
+    max_radius = max(3, min(20, min(crop_w, crop_h) * 4 // 10))
+    chroma_radius = min(max_radius, 9)  # 9 luôn an toàn, thấp hơn hẳn ngưỡng 10-11 đã gặp
+    return f"{max_radius}:5:{chroma_radius}:5"
+LEGACY_PLAYRES_HEIGHT = 288
+
+
+def _region_to_pixels(region: dict, target_width: int, target_height: int):
+    x1 = int(target_width * region["left"])
+    y1 = int(target_height * region["top"])
+    x2 = int(target_width * region["right"])
+    y2 = int(target_height * region["bottom"])
+    w = max(2, (x2 - x1) // 2 * 2)
+    h = max(2, (y2 - y1) // 2 * 2)
+    return x1, y1, w, h
+
+
+def _region_center_y_ratio(region: dict) -> float:
+    """Tỉ lệ 0.0-1.0 của điểm giữa vùng crop theo trục dọc, tính từ đỉnh khung hình."""
+    return (region["top"] + region["bottom"]) / 2
+
+
+def _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style, margin_v_probe):
+    probe_srt = os.path.join(OUTPUT_DIR, "_probe.srt")
+    probe_png = os.path.join(OUTPUT_DIR, "_probe.png")
+    with open(probe_srt, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:00,000 --> 00:00:05,000\nA\n")
+
+    probe_srt_escaped = probe_srt.replace("\\", "/").replace(":", "\\:")
+
+    cmd = [
+        'ffmpeg', '-y', '-i', video_file,
+        '-vf', (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+            f"subtitles={probe_srt_escaped}:force_style='{subtitles_style},Alignment=2,MarginV={margin_v_probe}'"
+        ).encode('utf-8'),
+        '-frames:v', '1', '-update', '1', probe_png,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if not os.path.exists(probe_png):
+        print(f"[probe-debug] ffmpeg stderr: {result.stderr[-800:]}", flush=True)
+
+    img = cv2.imread(probe_png)
+    os.remove(probe_srt)
+    if os.path.exists(probe_png):
+        os.remove(probe_png)
+    if img is None:
+        return None
+
+    b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
+    yellow_mask = (r > 180) & (g > 180) & (b < 120)
+    ys, _ = np.where(yellow_mask)
+    if len(ys) == 0:
+        return None
+    return int((ys.min() + ys.max()) / 2)
+
+
+def _compute_ocr_margin_v_by_measurement(video_file, target_width, target_height,
+                                          subtitles_style, region):
+    probe_margin_1, probe_margin_2 = 20, 200
+    y1 = _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style, probe_margin_1)
+    y2 = _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style, probe_margin_2)
+
+    target_y = int(target_height * _region_center_y_ratio(region))
+
+    if y1 is None or y2 is None or y1 == y2:
+        # Đo thất bại (hiếm khi xảy ra, vd font không load được) - fallback về giữa
+        # khung ảo 288 như cách cũ, còn hơn không có gì.
+        rprint("[bold yellow]Không đo được thực nghiệm vị trí sub, dùng công thức ước lượng dự phòng.[/bold yellow]")
+        return max(0, min(260, round((1 - _region_center_y_ratio(region)) * LEGACY_PLAYRES_HEIGHT)))
+
+    a = (y2 - y1) / (probe_margin_2 - probe_margin_1)
+    b = y1 - a * probe_margin_1
+    margin_v = (target_y - b) / a
+    return max(0, round(margin_v))
+
 
 def check_gpu_available():
     try:
@@ -77,17 +154,51 @@ def merge_subtitles_to_video():
     if is_portrait:
         rprint(f"[bold cyan]Video dọc (portrait) -> giảm font sub còn {trans_font_size}[/bold cyan]")
 
-    # Chỉ burn sub Việt (đã dịch), không burn sub gốc
-    ffmpeg_cmd = [
-        'ffmpeg', '-i', video_file,
-        '-vf', (
-            f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+    subtitle_source = load_key("subtitle_source")
+    ocr_region = load_key("ocr_region")
+    use_ocr_crop_style = (
+        subtitle_source == "ocr" and ocr_region and ocr_region.get("bottom") is not None
+    )
+
+    subtitles_style = (
+        f"FontSize={trans_font_size},FontName={TRANS_FONT_NAME},"
+        f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},"
+        f"OutlineWidth={TRANS_OUTLINE_WIDTH},BackColour={TRANS_BACK_COLOR},BorderStyle=4"
+    )
+
+    if use_ocr_crop_style:
+        rprint(f"[bold cyan]OCR có vùng crop -> làm mờ vùng {ocr_region}, đưa sub lên giữa vùng đó[/bold cyan]")
+        x1, y1, w, h = _region_to_pixels(ocr_region, TARGET_WIDTH, TARGET_HEIGHT)
+        blur_filter_str = (
+            f"split[base][forblur];"
+            f"[forblur]crop={w}:{h}:{x1}:{y1},boxblur={_compute_safe_blur_strength(w, h)}[blurred];"
+            f"[base][blurred]overlay={x1}:{y1}[withblur]"
+        )
+        margin_v = _compute_ocr_margin_v_by_measurement(
+            video_file, TARGET_WIDTH, TARGET_HEIGHT, subtitles_style, ocr_region
+        )
+        rprint(f"[bold cyan]Đo thực nghiệm: MarginV={margin_v}[/bold cyan]")
+        vf_chain = (
+            f"{blur_filter_str};"
+            f"[withblur]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={TRANS_SRT}:force_style='FontSize={trans_font_size},FontName={TRANS_FONT_NAME},"
-            f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-            f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
-        ).encode('utf-8'),
-    ]
+            f"subtitles={TRANS_SRT}:force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'[final]"
+        )
+        ffmpeg_cmd = [
+            'ffmpeg', '-i', video_file,
+            '-filter_complex', vf_chain.encode('utf-8'),
+            '-map', '[final]', '-map', '0:a?',
+        ]
+    else:
+        margin_v = compute_sub_margin_v(TARGET_HEIGHT)
+        ffmpeg_cmd = [
+            'ffmpeg', '-i', video_file,
+            '-vf', (
+                f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+                f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+                f"subtitles={TRANS_SRT}:force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'"
+            ).encode('utf-8'),
+        ]
 
     ffmpeg_gpu = load_key("ffmpeg_gpu")
     if ffmpeg_gpu:

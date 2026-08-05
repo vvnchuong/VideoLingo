@@ -58,10 +58,16 @@ def _extract_wave_and_sr(audio):
     return np.asarray(audio), 24000
 
 
-def vieneu_tts(text: str, save_path: str) -> None:
+def vieneu_tts(text: str, save_path: str, voice: str = None) -> None:
+    """
+    voice=None -> lấy từ config.yaml (hành vi CŨ, dùng cho dub - KHÔNG đổi gì
+    để không ảnh hưởng pipeline dub đang chạy ổn định).
+    voice="Tên giọng" -> override, dùng cho tính năng TTS đứng lẻ (user tự chọn
+    1 trong 10 giọng preset qua UI).
+    """
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     cfg   = _load_config().get("vieneu", {})
-    voice = cfg.get("voice", "Trọng Hữu")
+    voice = voice or cfg.get("voice", "Trọng Hữu")
     tts   = _load_vieneu()
 
     if _word_count(text) < MIN_WORDS_THRESHOLD:
@@ -107,4 +113,4 @@ if __name__ == "__main__":
     for i, t in enumerate(test_cases):
         out = f"test_output_vieneu/test_{i+1}.wav"
         print(f"[{i+1}] '{t}'")
-        vieneu_tts(t, out)
+        vieneu_tts(t, out)  

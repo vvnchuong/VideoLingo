@@ -4,20 +4,42 @@ import json
 import srt
 import datetime
 import pandas as pd
+import cv2
 
 import streamlit as st
 from core.utils import *
 from core.utils.models import _8_1_AUDIO_TASK
 from core.utils.delete_retry_dubbing import delete_dubbing_files
+from core._1_ytdlp import find_video_files
 
 SRC_SRT   = "output/src.srt"
 TRANS_SRT = "output/trans.srt"
 SUB_VIDEO = "output/output_sub.mp4"
 ZH_SYNC_JSON = "output/log/zh_sync.json"
 
-MAX_DISPLAY_CHARS = 42
+MAX_DISPLAY_CHARS_PORTRAIT  = 42
+MAX_DISPLAY_CHARS_LANDSCAPE = 60
 
-def _split_sub_for_display(text, start_s, end_s, max_chars=MAX_DISPLAY_CHARS):
+
+def _is_portrait_video():
+    try:
+        video_path = find_video_files()
+        cap = cv2.VideoCapture(video_path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        return h > w
+    except Exception:
+        return False
+
+
+def _current_max_display_chars():
+    return MAX_DISPLAY_CHARS_PORTRAIT if _is_portrait_video() else MAX_DISPLAY_CHARS_LANDSCAPE
+
+
+def _split_sub_for_display(text, start_s, end_s, max_chars=None):
+    if max_chars is None:
+        max_chars = _current_max_display_chars()
     text = text.strip()
     if not text: return []
     raw_parts = re.split(r'(?<=[\.\!\?,;:…])\s+', text)
@@ -88,7 +110,6 @@ def _df_for_editor(sync_rows) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def _editor_df_to_rows(edited_df: pd.DataFrame):
-    """Rebuild + sort theo thời gian, bỏ dòng Dịch rỗng."""
     parsed = []
     for _, row in edited_df.iterrows():
         vi = str(row.get("Dịch", "")).strip()
@@ -109,12 +130,10 @@ def _editor_df_to_rows(edited_df: pd.DataFrame):
     parsed.sort(key=lambda r: r[0])
     return [{"start": start, "end": end, "zh": src, "vi": vi} for start, end, src, vi in parsed]
 
-def _write_srt_display(path, rows, key):
-    """Ghi srt để BURN/XEM — tách câu dài thành nhiều dòng theo thời lượng (không phải bản 1:1
-    dùng cho TTS). zh_sync.json vẫn giữ câu đầy đủ, chỉ file .srt này bị tách nhỏ để hiển thị."""
+def _write_srt_display(path, rows, key, max_chars):
     entries = []
     for r in rows:
-        entries.extend(_split_sub_for_display(r[key], r["start"], r["end"]))
+        entries.extend(_split_sub_for_display(r[key], r["start"], r["end"], max_chars=max_chars))
     subs = [
         srt.Subtitle(index=i, start=_sec_to_td(e["start"]), end=_sec_to_td(e["end"]), content=e["text"])
         for i, e in enumerate(entries, 1)
@@ -123,14 +142,13 @@ def _write_srt_display(path, rows, key):
         f.write(srt.compose(subs))
 
 def _apply_edits(rows):
-    """Ghi lại zh_sync.json (nguồn thật, câu đầy đủ) + sinh lại src.srt/trans.srt bản đã tách dòng
-    hiển thị để xem trước/burn, rồi xóa cache dub cũ. Không đụng gì tới excel."""
     os.makedirs(os.path.dirname(ZH_SYNC_JSON), exist_ok=True)
     with open(ZH_SYNC_JSON, "w", encoding="utf-8") as f:
         json.dump(rows, f, ensure_ascii=False, indent=2)
 
-    _write_srt_display(SRC_SRT, rows, "zh")
-    _write_srt_display(TRANS_SRT, rows, "vi")
+    max_chars = _current_max_display_chars()
+    _write_srt_display(SRC_SRT, rows, "zh", max_chars)
+    _write_srt_display(TRANS_SRT, rows, "vi", max_chars)
 
     delete_dubbing_files()
     if os.path.exists(_8_1_AUDIO_TASK):

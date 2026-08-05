@@ -9,6 +9,9 @@ from core._1_ytdlp import find_video_files
 from core.asr_backend.audio_preprocess import normalize_audio_volume
 from core.utils import *
 from core.utils.models import *
+from core._7_sub_into_vid import (
+    _region_to_pixels, _compute_safe_blur_strength, _compute_ocr_margin_v_by_measurement,
+)
 
 console = Console()
 
@@ -59,32 +62,62 @@ def merge_video_audio():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
 
-    # dub.srt (từ _11_merge_audio.create_srt_subtitle) đã được tính theo THỜI LƯỢNG AUDIO TTS THẬT
-    # (new_sub_times), khớp đúng nhịp giọng đọc — dùng chung cho cả zh, KHÔNG override sang
-    # trans_subs_for_audio.srt nữa (file đó dùng thời lượng câu gốc tiếng Trung, không khớp giọng đọc
-    # tiếng Việt, gây ra hiện tượng sub chạy tiếp trong khi TTS đã đọc xong).
-
-    # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video
     is_portrait = TARGET_HEIGHT > TARGET_WIDTH
     trans_font_size = load_key("zh_pipeline.portrait_font_size") if is_portrait else TRANS_FONT_SIZE
     if is_portrait:
         rprint(f"[bold cyan]Video dọc (portrait) -> giảm font sub còn {trans_font_size}[/bold cyan]")
 
-    subtitle_filter = (
-        f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
-        f"force_style='FontSize={trans_font_size},"
-        f"FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
-        f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
-        f"BackColour={TRANS_BACK_COLOR},Alignment=2,MarginV=27,BorderStyle=4'"
+    margin_v = compute_sub_margin_v(TARGET_HEIGHT)
+
+    subtitle_source = load_key("subtitle_source")
+    ocr_region = load_key("ocr_region")
+    use_ocr_crop_style = (
+        subtitle_source == "ocr" and ocr_region and ocr_region.get("bottom") is not None
     )
+
+    subtitles_style = (
+        f"FontSize={trans_font_size},FontName={TRANS_FONT_NAME},PrimaryColour={TRANS_FONT_COLOR},"
+        f"OutlineColour={TRANS_OUTLINE_COLOR},OutlineWidth={TRANS_OUTLINE_WIDTH},"
+        f"BackColour={TRANS_BACK_COLOR},BorderStyle=4"
+    )
+
+    if use_ocr_crop_style:
+        rprint(f"[bold cyan]OCR có vùng crop -> làm mờ vùng {ocr_region}, đưa sub lên giữa vùng đó[/bold cyan]")
+        x1, y1, w, h = _region_to_pixels(ocr_region, TARGET_WIDTH, TARGET_HEIGHT)
+        ocr_margin_v = _compute_ocr_margin_v_by_measurement(
+            VIDEO_FILE, TARGET_WIDTH, TARGET_HEIGHT, subtitles_style, ocr_region
+        )
+        rprint(f"[bold cyan]Đo thực nghiệm: MarginV={ocr_margin_v}[/bold cyan]")
+        subtitle_filter = (
+            f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
+            f"force_style='{subtitles_style},Alignment=2,MarginV={ocr_margin_v}'"
+        )
+        filter_complex = (
+            f"[0:v]split[base][forblur];"
+            f"[forblur]crop={w}:{h}:{x1}:{y1},boxblur={_compute_safe_blur_strength(w, h)}[blurred];"
+            f"[base][blurred]overlay={x1}:{y1}[withblur];"
+            f"[withblur]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
+            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
+            f"{subtitle_filter}[v];"
+            f"[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]"
+        )
+    else:
+        # Hành vi CŨ, giữ nguyên y hệt trước - áp dụng cho Whisper hoặc OCR không
+        # có vùng crop tuỳ chỉnh.
+        subtitle_filter = (
+            f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
+            f"force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'"
+        )
+        filter_complex = (
+            f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
+            f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
+            f'{subtitle_filter}[v];'
+            f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]'
+        )
 
     cmd = [
         'ffmpeg', '-y', '-i', VIDEO_FILE, '-i', background_file, '-i', normalized_dub_audio,
-        '-filter_complex',
-        f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
-        f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
-        f'{subtitle_filter}[v];'
-        f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]'
+        '-filter_complex', filter_complex,
     ]
 
     if load_key("ffmpeg_gpu"):
@@ -95,7 +128,9 @@ def merge_video_audio():
 
     cmd.extend(['-c:a', 'aac', '-b:a', '96k', DUB_VIDEO])
 
-    subprocess.run(cmd)
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg merge_video_audio thất bại, exit code={result.returncode}")
     rprint(f"[bold green]Video and audio successfully merged into {DUB_VIDEO}[/bold green]")
 
 
