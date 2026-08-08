@@ -27,6 +27,16 @@ def is_dynamic_routing_active() -> bool:
 
 
 def generate_dub_audio(text: str, save_path: str) -> None:
+    # QUAN TRỌNG: bỏ qua nếu file đã có sẵn - _prefetch_capcut_merged() đã tải
+    # sẵn hàng loạt câu trước đó (merged-batch, ít request hơn nhiều), file đã
+    # nằm đúng chỗ save_path rồi. THIẾU CHECK NÀY khiến process_row() gọi lại
+    # CapCut THÊM 1 LẦN NỮA cho mỗi dòng dù đã prefetch xong - gây treo/lỗi do
+    # gọi trùng quá nhiều lần liên tiếp (đã gặp thực tế). tts_main() gốc có
+    # đúng check này (dòng "if os.path.exists(save_as): return"), copy lại
+    # style y hệt cho nhất quán.
+    if os.path.exists(save_path):
+        return
+
     voice_id = get_selected_voice_id()
     backend = backend_of(voice_id)
 

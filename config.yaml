@@ -4,22 +4,22 @@ display_language: "en"
 
 # API settings
 api:
-  key: 'YOUR_API_KEY_HERE'
+  key: 'YOUR_API_KEY'
   keys:
   - 'YOUR_API_KEY_1'
   - 'YOUR_API_KEY_2'
   - 'YOUR_API_KEY_3'
-#  key: 'YOUR_API_KEY_OLD'
+#  key: 'YOUR_ALT_API_KEY'
   base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'
 #  base_url: 'https://api.groq.com/openai/v1'
   model: 'gemini-3.1-flash-lite'
 #  model: 'qwen/qwen3-32b'
 #  model: 'meta-llama/llama-4-scout-17b-16e-instruct'
   llm_support_json: true
-max_workers: 1
+max_workers: 2
 
 target_language: 'Tiếng Việt'
-subtitle_source: 'ocr'
+subtitle_source: 'whisper'
 
 demucs: false
 
@@ -27,10 +27,10 @@ ocr_region:
 whisper:
   model: 'medium'
   language: 'zh'
-  detected_language: 'en'
+  detected_language: 'zh'
   runtime: 'local'
-  whisperX_302_api_key: ''
-  elevenlabs_api_key: ''
+  whisperX_302_api_key: 'YOUR_WHISPERX_API_KEY'
+  elevenlabs_api_key: 'YOUR_ELEVENLABS_API_KEY'
 
 burn_subtitles: true
 
@@ -57,27 +57,27 @@ pause_before_translate: false
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: ''
+  api_key: 'YOUR_SF_FISH_TTS_API_KEY'
   voice: 'anna'
   custom_name: ''
-  voice_id: ''
+  voice_id: 'YOUR_VOICE_ID'
   mode: "preset"
 
 openai_tts:
-  api_key: ''
+  api_key: 'YOUR_OPENAI_API_KEY'
   voice: 'alloy'
 
 azure_tts:
-  api_key: ''
+  api_key: 'YOUR_AZURE_API_KEY'
   voice: 'vi-VN-HoaiMyNeural'
 
 fish_tts:
-  api_key: ''
+  api_key: 'YOUR_FISH_TTS_API_KEY'
   character: ''
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: ''
+  api_key: 'YOUR_SF_COSYVOICE2_API_KEY'
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -87,7 +87,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: ''
+  302_api: 'YOUR_F5TTS_API_KEY'
 
 speed_factor:
   min: 1
@@ -144,16 +144,16 @@ language_split_without_space:
 vieneu:
   mode: "v3turbo"
   voice: "Trúc Ly"
-  hf_home: "D:/hf_cache"
+  hf_home: "YOUR_HF_HOME_PATH"
 
 ## ======================== ZH Pipeline ======================== ##
-# Chỉ dùng khi whisper.language = 'zh'
-# Pipeline riêng cho tiếng Trung: VAD + faster-whisper clip + Gemini dịch duration-aware
-# Bypass hoàn toàn WhisperX alignment (wav2vec2-zh hay fail) + spaCy ZH split
-
+translate_max_sentences_per_chunk: 150
+translate_chunk_size_chars: 999999
 zh_pipeline:
   gemini_api_key: 'YOUR_GEMINI_API_KEY_1, YOUR_GEMINI_API_KEY_2'
   gemini_model: 'gemini-3.1-flash-lite'
+  translate_engine: 'pipeline_goc'
+  pipeline_goc_chunk_size: 150
   whisper_model_zh: 'medium'
   demucs_for_vad: true
   demucs_model: 'htdemucs'

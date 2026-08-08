@@ -1,4 +1,5 @@
 import os, re, gc, json, time, asyncio, tempfile, shutil, sys, subprocess, datetime, warnings
+import concurrent.futures
 import torch, srt, pandas as pd
 import cv2
 from datetime import timedelta
@@ -167,8 +168,15 @@ def _is_refusal(text):
 
 def _split_sub_for_display(text, start_s, end_s, max_chars=MAX_DISPLAY_CHARS):
     text = text.strip()
+    # QUAN TRỌNG: KHÔNG được return [] khi text rỗng. zh_display và vi_display
+    # (gọi hàm này riêng cho "zh" và "vi" của cùng 1 dòng) PHẢI luôn sinh ra
+    # cùng số lượng entry, 1-1 theo index - nếu một bên trả về [] còn bên kia
+    # trả về 1 entry, 2 file src.srt/trans.srt bị lệch số dòng, gây lỗi "File
+    # phụ đề gốc và bản dịch không khớp số dòng" ở SubtitleService.readSubtitle()
+    # phía Java. Luôn trả về đúng 1 entry, kể cả khi text rỗng (dùng khoảng
+    # trắng để không phá format SRT).
     if not text:
-        return []
+        return [{"start": start_s, "end": end_s, "text": " "}]
     raw_parts = re.split(r'(?<=[\.\!\?,;:…])\s+', text)
     raw_parts = [p.strip() for p in raw_parts if p.strip()] or [text]
     lines, cur = [], ""
@@ -491,6 +499,54 @@ KHÔNG thêm gì khác ngoài JSON.
 ## Input (câu gốc, bản dịch nháp, duration, theo đúng timeline)
 {input_json}
 """
+
+def gemini_watermark_filter_only(data, client, batch_size=80):
+    """
+    Chỉ lấy phần "phát hiện rác/watermark" của gemini_review_pass, KHÔNG lấy
+    phần "viết lại vi" - dùng sau pipeline_goc_translate để giữ nguyên bản
+    dịch chất lượng cao của pipeline gốc, chỉ mượn Gemini để lọc rác OCR
+    (watermark/logo lặp lại) mà pipeline gốc không tự phát hiện được vì nó
+    dịch từng câu độc lập, không có bước xem lại toàn video theo timeline.
+    """
+    rprint(f"[cyan]🔎 Lọc watermark/rác (không đổi bản dịch): xem lại {len(data)} câu...[/cyan]")
+    all_remove = {}
+    for bstart in range(0, len(data), batch_size):
+        batch = data[bstart:bstart + batch_size]
+        items = [
+            {"i": bstart + j, "zh": d["zh"], "vi_draft": d["vi"], "duration": round(d["end"] - d["start"], 2)}
+            for j, d in enumerate(batch)
+        ]
+        prompt = _REVIEW_PROMPT.replace("{syllable_rate}", str(SYLLABLE_RATE)).replace("{input_json}", json.dumps(items, ensure_ascii=False))
+        for attempt in range(3):
+            try:
+                resp_text = _gemini_generate(prompt)
+                raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", resp_text.strip())
+                rows = json.loads(raw)
+                if not isinstance(rows, list):
+                    raise ValueError("Not a list")
+                for row in rows:
+                    if "i" not in row:
+                        continue
+                    if row.get("remove", False):
+                        all_remove[row["i"]] = True
+                break
+            except Exception as e:
+                rprint(f"[yellow]⚠ Lọc watermark lỗi batch (lần {attempt+1}): {e}[/yellow]")
+                time.sleep(1.5)
+
+    result, removed_count = [], 0
+    for i, d in enumerate(data):
+        if all_remove.get(i, False):
+            removed_count += 1
+            rprint(f"   [{i+1:03d}] [-] Loại bỏ (nghi watermark/rác): {d['zh'][:40]}")
+            continue
+        result.append(d)  # giữ nguyên y hệt bản dịch pipeline gốc, không đổi "vi"
+
+    if removed_count:
+        rprint(f"[yellow]ℹ Đã loại {removed_count} câu nghi là watermark/rác[/yellow]")
+    rprint(f"[green]✅ Lọc watermark hoàn tất → còn {len(result)} câu[/green]")
+    return result
+
 
 def gemini_review_pass(data, client, batch_size=80, context_tail=4):
     """
@@ -866,6 +922,96 @@ def gemini_fix_undershoot(data, client, ratio_threshold=0.85, batch_size=80):
     return data
 
 
+def _translate_one_batch(data, bstart, chunk_size):
+    """Dịch 1 batch (dùng làm task cho ThreadPoolExecutor trong
+    pipeline_goc_translate). Trả về (bstart, list kết quả của batch này)."""
+    from core.translate_lines import translate_lines
+
+    batch = data[bstart:bstart + chunk_size]
+    lines = "\n".join(d["zh"] for d in batch)
+
+    prev_batch = data[bstart - 3:bstart] if bstart > 0 else None
+    previous_content_prompt = [d["zh"] for d in prev_batch] if prev_batch else None
+    next_batch = data[bstart + chunk_size:bstart + chunk_size + 2]
+    after_content_prompt = [d["zh"] for d in next_batch] if next_batch else None
+
+    translation, _ = translate_lines(
+        lines, previous_content_prompt, after_content_prompt,
+        things_to_note_prompt=None, summary_prompt=None,
+        index=bstart // chunk_size,
+    )
+    vi_lines = translation.split("\n")
+    if len(vi_lines) != len(batch):
+        # translate_lines() đã tự retry 3 lần nếu số dòng lệch, nhưng nếu
+        # vẫn lệch sau retry thì raise lỗi rõ ràng thay vì lặng lẽ ghép sai
+        # dòng (dữ liệu OCR/dub sẽ bị lệch câu nếu cứ tiếp tục chạy).
+        raise RuntimeError(
+            f"pipeline_goc_translate: batch {bstart} dịch ra {len(vi_lines)} dòng, "
+            f"cần {len(batch)} dòng - dữ liệu có thể bị lệch."
+        )
+
+    batch_result = []
+    for d, vi in zip(batch, vi_lines):
+        vi = vi.strip()
+        if not vi:
+            # Câu dịch rỗng (thường do câu gốc là rác OCR như watermark
+            # "NTTS"/chữ lẻ vô nghĩa) làm lệch số dòng src.srt/trans.srt khi
+            # ghi file - fallback về câu gốc để không bao giờ rỗng.
+            vi = d["zh"]
+            rprint(f"[yellow]⚠ Câu dịch rỗng, giữ nguyên bản gốc: {d['zh'][:30]}[/yellow]")
+        batch_result.append({"start": d["start"], "end": d["end"], "zh": d["zh"], "vi": vi})
+    return bstart, batch_result
+
+
+def pipeline_goc_translate(data):
+    """
+    Dịch OCR bằng đúng lõi dịch của pipeline gốc VideoLingo (translate_lines -
+    faithfulness + reflect/expressiveness check 2 bước), KHÔNG ép số âm tiết
+    khớp thời lượng như gemini_translate. Dùng khi config.yaml đặt
+    zh_pipeline.translate_engine: "pipeline_goc" (mặc định "gemini_4pass" giữ
+    nguyên hành vi cũ).
+
+    Vì không ép âm tiết ở đây, câu quá nhanh/chậm sẽ được zh_gen_audio_tasks
+    (đã có sẵn logic if_too_fast/speed_factor) tự xử lý ở bước audio sau,
+    giống hệt cách pipeline gốc Whisper vẫn làm - KHÔNG gọi
+    gemini_review_pass/gemini_fix_overlong/gemini_fix_undershoot sau hàm này.
+
+    Các batch được dịch SONG SONG qua ThreadPoolExecutor(max_workers), dùng
+    đúng config "max_workers" có sẵn - giống hệt cách _4_2_translate.py
+    (pipeline gốc Whisper) đang làm, để 2 luồng nhất quán với nhau. Số lần
+    gọi API không đổi (vẫn 2 lần/batch: faithfulness + expressiveness) - chỉ
+    đổi việc các batch chạy đồng thời hay nối đuôi nhau.
+    """
+    rprint(f"[cyan]📝 Dịch {len(data)} câu bằng pipeline gốc (translate_lines)...[/cyan]")
+
+    # Đọc từ config để dễ test nhiều mức mà không cần sửa code. Batch càng lớn
+    # càng ít lần gọi API, nhưng rủi ro Gemini trả lệch số dòng cũng tăng theo
+    # (translate_lines() raise lỗi nếu số dòng output != input, phải dịch lại
+    # cả batch đó) - 10 là mặc định an toàn kiểu cũ, thử tăng dần (vd 50, 100)
+    # để cân bằng tốc độ/chi phí API với độ ổn định.
+    chunk_size = _cfg("zh_pipeline.pipeline_goc_chunk_size", 10)
+    max_workers = _cfg("max_workers", 1)
+    batch_starts = list(range(0, len(data), chunk_size))
+
+    results_by_start = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_translate_one_batch, data, bstart, chunk_size): bstart
+                   for bstart in batch_starts}
+        for future in concurrent.futures.as_completed(futures):
+            bstart, batch_result = future.result()  # raise lại lỗi nếu batch đó lỗi, dừng cả job
+            results_by_start[bstart] = batch_result
+
+    result = []
+    for bstart in batch_starts:  # ghép lại ĐÚNG THỨ TỰ gốc, không theo thứ tự hoàn thành
+        result.extend(results_by_start[bstart])
+
+    for i, r in enumerate(result):
+        dur = r["end"] - r["start"]
+        rprint(f"   [{i+1:03d}] dur={dur:.1f}s | {r['vi'][:50]}")
+
+    return result
+
+
 def gemini_translate(data, client, is_portrait=False):
     rprint(f"[cyan]📝 Gemini dịch {len(data)} câu (batch={TRANSLATE_BATCH})...[/cyan]")
     all_vi,all_syl,prev_tail={},{},[]
@@ -1013,15 +1159,34 @@ def zh_asr_and_translate(session_id=None):
         is_portrait = _is_portrait_video(video_path)
         if is_portrait:
             rprint("[bold cyan]📱 Phát hiện video dọc (portrait/short) -> font sub sẽ tự nhỏ hơn khi burn[/bold cyan]")
-        data=gemini_translate(data,client)
-        if not data: raise RuntimeError("Gemini không dịch được câu nào")
 
-        data = gemini_review_pass(data, client)
-        if not data: raise RuntimeError("Review pass loại bỏ hết câu, kiểm tra lại OCR/dịch")
+        # Cho phép thử nghiệm 2 engine dịch song song mà không cần sửa code -
+        # đổi zh_pipeline.translate_engine trong config.yaml giữa các lần chạy.
+        translate_engine = _cfg("zh_pipeline.translate_engine", "gemini_4pass")
 
-        data = gemini_fix_overlong(data, client)
+        if translate_engine == "pipeline_goc":
+            data = pipeline_goc_translate(data)
+            if not data: raise RuntimeError("pipeline gốc không dịch được câu nào")
+            # Mượn Gemini CHỈ để lọc watermark/rác OCR (không đụng vào bản dịch
+            # pipeline gốc) - pipeline gốc dịch từng câu độc lập nên không tự
+            # phát hiện được watermark lặp lại xuyên suốt video như review pass.
+            data = gemini_watermark_filter_only(data, client)
+            if not data: raise RuntimeError("Lọc watermark loại bỏ hết câu, kiểm tra lại OCR")
+            # KHÔNG gọi gemini_review_pass (sẽ ghi đè mất bản dịch pipeline gốc)
+            # /fix_overlong/fix_undershoot ở đây: pipeline_goc_translate không
+            # ép âm tiết nên không có khái niệm "quá dài/quá ngắn" cần Gemini
+            # sửa - zh_gen_audio_tasks sẽ tự xử lý tốc độ đọc ở bước audio sau,
+            # giống pipeline gốc Whisper.
+        else:
+            data=gemini_translate(data,client)
+            if not data: raise RuntimeError("Gemini không dịch được câu nào")
 
-        data = gemini_fix_undershoot(data, client)
+            data = gemini_review_pass(data, client)
+            if not data: raise RuntimeError("Review pass loại bỏ hết câu, kiểm tra lại OCR/dịch")
+
+            data = gemini_fix_overlong(data, client)
+
+            data = gemini_fix_undershoot(data, client)
 
         min_dur_whisper = _cfg("min_subtitle_duration", 2.5)
         ocr_min_dur = _cfg("zh_pipeline.ocr_min_subtitle_duration", 0.8)

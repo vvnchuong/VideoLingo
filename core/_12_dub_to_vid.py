@@ -10,7 +10,7 @@ from core.asr_backend.audio_preprocess import normalize_audio_volume
 from core.utils import *
 from core.utils.models import *
 from core._7_sub_into_vid import (
-    _region_to_pixels, _compute_safe_blur_strength, _compute_ocr_margin_v_by_measurement,
+    _region_to_pixels, _compute_safe_blur_strength, _compute_ocr_margin_v,
 )
 
 console = Console()
@@ -81,15 +81,21 @@ def merge_video_audio():
         f"BackColour={TRANS_BACK_COLOR},BorderStyle=4"
     )
 
+    # QUAN TRỌNG: trong filter_complex, dấu ':' và '\' trong đường dẫn phải được
+    # escape, nếu không ffmpeg/libass parse sai cú pháp filter (path Windows kiểu
+    # C:\...\output\dub.srt có dấu ':' sẽ làm vỡ filter con "subtitles=...",
+    # có thể khiến sub không hiện dù ffmpeg không báo lỗi).
+    dub_sub_file_escaped = DUB_SUB_FILE.replace("\\", "/").replace(":", "\\:")
+
     if use_ocr_crop_style:
         rprint(f"[bold cyan]OCR có vùng crop -> làm mờ vùng {ocr_region}, đưa sub lên giữa vùng đó[/bold cyan]")
         x1, y1, w, h = _region_to_pixels(ocr_region, TARGET_WIDTH, TARGET_HEIGHT)
-        ocr_margin_v = _compute_ocr_margin_v_by_measurement(
-            VIDEO_FILE, TARGET_WIDTH, TARGET_HEIGHT, subtitles_style, ocr_region
-        )
-        rprint(f"[bold cyan]Đo thực nghiệm: MarginV={ocr_margin_v}[/bold cyan]")
+        # Tính MarginV trực tiếp theo pixel thật của vùng crop, không render thử
+        # gì cả (xem ghi chú trong _compute_ocr_margin_v ở _7_sub_into_vid.py).
+        ocr_margin_v = _compute_ocr_margin_v(TARGET_HEIGHT, ocr_region, trans_font_size)
+        rprint(f"[bold cyan]MarginV tính theo vùng crop: {ocr_margin_v}[/bold cyan]")
         subtitle_filter = (
-            f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
+            f"subtitles={dub_sub_file_escaped}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
             f"force_style='{subtitles_style},Alignment=2,MarginV={ocr_margin_v}'"
         )
         filter_complex = (
@@ -105,7 +111,7 @@ def merge_video_audio():
         # Hành vi CŨ, giữ nguyên y hệt trước - áp dụng cho Whisper hoặc OCR không
         # có vùng crop tuỳ chỉnh.
         subtitle_filter = (
-            f"subtitles={DUB_SUB_FILE}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
+            f"subtitles={dub_sub_file_escaped}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
             f"force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'"
         )
         filter_complex = (
