@@ -81,17 +81,11 @@ def merge_video_audio():
         f"BackColour={TRANS_BACK_COLOR},BorderStyle=4"
     )
 
-    # QUAN TRỌNG: trong filter_complex, dấu ':' và '\' trong đường dẫn phải được
-    # escape, nếu không ffmpeg/libass parse sai cú pháp filter (path Windows kiểu
-    # C:\...\output\dub.srt có dấu ':' sẽ làm vỡ filter con "subtitles=...",
-    # có thể khiến sub không hiện dù ffmpeg không báo lỗi).
     dub_sub_file_escaped = DUB_SUB_FILE.replace("\\", "/").replace(":", "\\:")
 
     if use_ocr_crop_style:
         rprint(f"[bold cyan]OCR có vùng crop -> làm mờ vùng {ocr_region}, đưa sub lên giữa vùng đó[/bold cyan]")
         x1, y1, w, h = _region_to_pixels(ocr_region, TARGET_WIDTH, TARGET_HEIGHT)
-        # Tính MarginV trực tiếp theo pixel thật của vùng crop, không render thử
-        # gì cả (xem ghi chú trong _compute_ocr_margin_v ở _7_sub_into_vid.py).
         ocr_margin_v = _compute_ocr_margin_v(TARGET_HEIGHT, ocr_region, trans_font_size)
         rprint(f"[bold cyan]MarginV tính theo vùng crop: {ocr_margin_v}[/bold cyan]")
         subtitle_filter = (
@@ -131,6 +125,10 @@ def merge_video_audio():
         cmd.extend(['-map', '[v]', '-map', '[a]', '-c:v', 'h264_nvenc'])
     else:
         cmd.extend(['-map', '[v]', '-map', '[a]'])
+        # limit ffmpeg thread count
+        ffmpeg_threads = load_key("ffmpeg_threads")
+        if ffmpeg_threads and ffmpeg_threads > 0:
+            cmd.extend(['-threads', str(ffmpeg_threads)])
 
     cmd.extend(['-c:a', 'aac', '-b:a', '96k', DUB_VIDEO])
 

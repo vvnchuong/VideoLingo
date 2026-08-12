@@ -4,12 +4,12 @@ display_language: "en"
 
 # API settings
 api:
-  key: 'YOUR_API_KEY'
+  key: 'YOUR_GEMINI_API_KEY'
   keys:
-  - 'YOUR_API_KEY_1'
-  - 'YOUR_API_KEY_2'
-  - 'YOUR_API_KEY_3'
-#  key: 'YOUR_ALT_API_KEY'
+  - 'YOUR_GEMINI_API_KEY_1'
+  - 'YOUR_GEMINI_API_KEY_2'
+  - 'YOUR_GEMINI_API_KEY_3'
+#  key: 'YOUR_GROQ_API_KEY'
   base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'
 #  base_url: 'https://api.groq.com/openai/v1'
   model: 'gemini-3.1-flash-lite'
@@ -19,11 +19,15 @@ api:
 max_workers: 2
 
 target_language: 'Tiếng Việt'
-subtitle_source: 'whisper'
+subtitle_source: 'ocr'
 
 demucs: false
 
 ocr_region:
+  top: 0.7446489396656203
+  bottom: 0.809438092263176
+  left: 0.073258529834533
+  right: 0.913258529834533
 whisper:
   model: 'medium'
   language: 'zh'
@@ -36,7 +40,11 @@ burn_subtitles: true
 
 ## ======================== Advanced Settings ======================== ##
 
-ffmpeg_gpu: false
+ffmpeg_gpu: true
+# Limit FFmpeg thread count
+ffmpeg_threads: 4
+# (24GB -> 20000, 16GB -> ~13000, ...).
+vram_threshold_mb: 4000
 
 youtube:
   cookies_path: ''
@@ -57,10 +65,10 @@ pause_before_translate: false
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: 'YOUR_SF_FISH_TTS_API_KEY'
+  api_key: 'YOUR_FISH_TTS_API_KEY'
   voice: 'anna'
   custom_name: ''
-  voice_id: 'YOUR_VOICE_ID'
+  voice_id: ''
   mode: "preset"
 
 openai_tts:
@@ -77,7 +85,7 @@ fish_tts:
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: 'YOUR_SF_COSYVOICE2_API_KEY'
+  api_key: 'YOUR_COSYVOICE_API_KEY'
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -87,7 +95,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: 'YOUR_F5TTS_API_KEY'
+  302_api: 'YOUR_302_API_KEY'
 
 speed_factor:
   min: 1
@@ -100,8 +108,8 @@ tolerance: 1.5
 
 ## ======================== Additional settings ======================== ##
 
-model_dir: './_model_cache'
-
+#model_dir: './_model_cache'
+model_dir: 'YOUR_LOCAL_MODEL_DIR_PATH'
 allowed_video_formats:
 - 'mp4'
 - 'mov'
@@ -144,7 +152,7 @@ language_split_without_space:
 vieneu:
   mode: "v3turbo"
   voice: "Trúc Ly"
-  hf_home: "YOUR_HF_HOME_PATH"
+  hf_home: "YOUR_LOCAL_HF_HOME_PATH"
 
 ## ======================== ZH Pipeline ======================== ##
 translate_max_sentences_per_chunk: 150
@@ -157,14 +165,11 @@ zh_pipeline:
   whisper_model_zh: 'medium'
   demucs_for_vad: true
   demucs_model: 'htdemucs'
-  # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video (không đổi độ dài sub)
   portrait_font_size: 10
-  # Ngưỡng ký tự để tách 1 câu dịch thành nhiều dòng khi TTS đọc (ưu tiên cắt tại dấu câu/phẩy).
-  # Tăng lên nếu thấy TTS bị khựng/ngắt hơi nhiều giữa câu; giảm xuống nếu sub hiện quá dài/trễ so với thoại.
-  tts_split_max_chars: 42 # dung sub do nghe duoc nen de nho lai, tranh tran sub
-  ocr_tts_split_max_chars: 200 # ocr dung sub trong video nen de cao cho thoang
+  tts_split_max_chars: 42
+  ocr_tts_split_max_chars: 200
   no_speech_threshold: 0.95
   ocr_min_subtitle_duration: 0.8
   syllable_rate: 4.0
-  merge_min_zh_duration: 1.2   # đoạn ngắn hơn 1.2s sẽ được xét gộp
-  merge_max_zh_gap: 0.5        # chỉ gộp nếu khoảng lặng giữa 2 đoạn < 0.5s
+  merge_min_zh_duration: 1.2
+  merge_max_zh_gap: 0.5

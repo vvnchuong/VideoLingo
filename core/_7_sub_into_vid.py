@@ -35,7 +35,7 @@ TRANS_SRT = f"{OUTPUT_DIR}/trans.srt"
 
 def _compute_safe_blur_strength(crop_w: int, crop_h: int) -> str:
     max_radius = max(3, min(20, min(crop_w, crop_h) * 4 // 10))
-    chroma_radius = min(max_radius, 9)  # 9 luôn an toàn, thấp hơn hẳn ngưỡng 10-11 đã gặp
+    chroma_radius = min(max_radius, 9)
     return f"{max_radius}:5:{chroma_radius}:5"
 LEGACY_PLAYRES_HEIGHT = 288
 
@@ -51,32 +51,10 @@ def _region_to_pixels(region: dict, target_width: int, target_height: int):
 
 
 def _region_center_y_ratio(region: dict) -> float:
-    """Tỉ lệ 0.0-1.0 của điểm giữa vùng crop theo trục dọc, tính từ đỉnh khung hình."""
     return (region["top"] + region["bottom"]) / 2
 
 
 def _compute_ocr_margin_v(target_height: int, region: dict, font_size: int) -> int:
-    """
-    QUAN TRỌNG: khi ffmpeg convert .srt sang ASS nội bộ (filter "subtitles="),
-    nó LUÔN tạo script với PlayResY=288 cố định (mặc định của ffmpeg), bất kể
-    video thật cao bao nhiêu pixel, và "original_size" KHÔNG thay đổi điều này
-    (option đó chỉ sửa lỗi tỉ lệ khung hình/font-scale, không đổi PlayResY).
-    MarginV trong ASS luôn chạy theo hệ toạ độ PlayResY=288 này, KHÔNG PHẢI
-    pixel thật của video. Nếu tính MarginV theo pixel thật (vd video 1920px
-    cao) sẽ ra số > 288, khiến libass đẩy chữ ra ngoài khung ảo -> mất chữ
-    hoàn toàn (không lệch vị trí, mà biến mất luôn, không vẽ gì cả).
-
-    Vậy phải tính theo TỈ LỆ (0.0-1.0) rồi nhân với 288, không phải target_height.
-
-    Yêu cầu: DÒNG ĐẦU (dòng duy nhất nếu 1 dòng) của sub phải nằm giữa vùng
-    crop theo chiều dọc. Dòng 2 (nếu sub bị wrap 2 dòng) cứ xếp xuống dưới dòng
-    1 bình thường, tràn ra ngoài crop cũng không sao.
-
-    Alignment=2 (bottom-center) neo theo ĐÁY của dòng cuối cùng, cách đáy khung
-    ẢO (cao 288) MarginV đơn vị ảo. font_size cũng chạy theo cùng thang ảo này
-    (đó là lý do portrait_font_size=10 vẫn đọc được - nó không phải pixel thật,
-    mà là đơn vị theo thang PlayResY=288).
-    """
     line_height = font_size * 1.3
     center_crop_ratio = _region_center_y_ratio(region)  # 0.0-1.0
     center_crop_y_virtual = LEGACY_PLAYRES_HEIGHT * center_crop_ratio
@@ -87,14 +65,6 @@ def _compute_ocr_margin_v(target_height: int, region: dict, font_size: int) -> i
 
 def _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style,
                                 margin_v_probe, use_original_size=False):
-    """
-    use_original_size PHẢI khớp chính xác với filter dùng lúc burn sub thật sự
-    (subtitles=...:original_size=WxH có mặt hay không). MarginV trong ASS chạy
-    theo hệ toạ độ PlayResY - nếu không có original_size, libass tự suy PlayResY
-    từ script (thường ra một giá trị ảo, không phải chiều cao pixel thật của
-    video). Đo ở một hệ toạ độ rồi burn ở hệ toạ độ khác sẽ làm sub lệch hẳn
-    khỏi vùng crop mong muốn.
-    """
     probe_srt = os.path.join(OUTPUT_DIR, "_probe.srt")
     probe_png = os.path.join(OUTPUT_DIR, "_probe.png")
     with open(probe_srt, "w", encoding="utf-8") as f:
@@ -143,8 +113,6 @@ def _compute_ocr_margin_v_by_measurement(video_file, target_width, target_height
     target_y = int(target_height * _region_center_y_ratio(region))
 
     if y1 is None or y2 is None or y1 == y2:
-        # Đo thất bại (hiếm khi xảy ra, vd font không load được) - fallback về giữa
-        # khung ảo 288 như cách cũ, còn hơn không có gì.
         rprint("[bold yellow]Không đo được thực nghiệm vị trí sub, dùng công thức ước lượng dự phòng.[/bold yellow]")
         return max(0, min(260, round((1 - _region_center_y_ratio(region)) * LEGACY_PLAYRES_HEIGHT)))
 
@@ -191,7 +159,6 @@ def merge_subtitles_to_video():
     video.release()
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
 
-    # Video dọc (portrait/short: cao > rộng) -> chữ nhỏ lại cho đỡ che video
     is_portrait = TARGET_HEIGHT > TARGET_WIDTH
     trans_font_size = load_key("zh_pipeline.portrait_font_size") if is_portrait else TRANS_FONT_SIZE
     if is_portrait:
@@ -217,14 +184,8 @@ def merge_subtitles_to_video():
             f"[forblur]crop={w}:{h}:{x1}:{y1},boxblur={_compute_safe_blur_strength(w, h)}[blurred];"
             f"[base][blurred]overlay={x1}:{y1}[withblur]"
         )
-        # Tính MarginV trực tiếp theo pixel thật của vùng crop, không render thử
-        # gì cả (xem ghi chú trong _compute_ocr_margin_v).
         margin_v = _compute_ocr_margin_v(TARGET_HEIGHT, ocr_region, trans_font_size)
         rprint(f"[bold cyan]MarginV tính theo vùng crop: {margin_v}[/bold cyan]")
-        # QUAN TRỌNG: trong filter_complex, dấu ':' và '\' trong đường dẫn phải
-        # được escape, nếu không ffmpeg parse sai cú pháp filter (path Windows
-        # kiểu D:\video\... có dấu ':' sẽ làm vỡ toàn bộ filter_complex, khiến
-        # burn sub thất bại âm thầm tuỳ máy/tuỳ đường dẫn video).
         trans_srt_escaped = TRANS_SRT.replace("\\", "/").replace(":", "\\:")
         vf_chain = (
             f"{blur_filter_str};"
@@ -254,6 +215,11 @@ def merge_subtitles_to_video():
     if ffmpeg_gpu:
         rprint("[bold green]will use GPU acceleration.[/bold green]")
         ffmpeg_cmd.extend(['-c:v', 'h264_nvenc'])
+    else:
+        # limit ffmpeg thread count
+        ffmpeg_threads = load_key("ffmpeg_threads")
+        if ffmpeg_threads and ffmpeg_threads > 0:
+            ffmpeg_cmd.extend(['-threads', str(ffmpeg_threads)])
     ffmpeg_cmd.extend(['-y', OUTPUT_VIDEO])
 
     rprint("🎬 Start merging subtitles to video...")
