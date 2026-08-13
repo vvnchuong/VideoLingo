@@ -290,10 +290,12 @@ async def run_dub_job(
     input_video: UploadFile = File(...),
     output_bundle: UploadFile = File(...),
     voice_id: str = Form(""),
+    subtitle_source: str = Form(""),
     ocr_top: str = Form(""),
     ocr_bottom: str = Form(""),
     ocr_left: str = Form(""),
     ocr_right: str = Form(""),
+    background_music_volume: str = Form(""),
     duration_seconds: str = Form("300"),
 ):
     """Nhận LẠI video gốc + output_bundle.zip (chứa TOÀN BỘ output/ từ lần /jobs/sub
@@ -301,7 +303,14 @@ async def run_dub_job(
     docstring đầu file). QUAN TRỌNG: KHÔNG chỉ gửi trans.srt - lỗi thật đã gặp:
     zh_gen_audio_tasks() (pipeline ZH) đọc output/log/zh_sync.json, không phải
     trans.srt, và có thể còn file khác cần tùy pipeline. Gửi cả bundle (giống hệt
-    cách /jobs/sub trả về) để không phải đoán/liệt kê từng file."""
+    cách /jobs/sub trả về) để không phải đoán/liệt kê từng file.
+
+    QUAN TRỌNG - subtitle_source PHẢI truyền lại: config.yaml của lần dub này là
+    bản MỚI copy từ template (KHÔNG kế thừa 'subtitle_source: ocr' đã set lúc sub
+    trước, vì mỗi request /jobs/* độc lập hoàn toàn - bản chất serverless). Thiếu
+    tham số này, _12_dub_to_vid.py đọc subtitle_source rỗng -> use_ocr_crop_style
+    luôn False -> MẤT crop/blur cho video OCR (lỗi thật đã gặp: dub video OCR
+    không blur, sub rơi về vị trí mặc định như Whisper)."""
     await _reserve_vram_slot_or_reject()
 
     job_id = uuid.uuid4().hex
@@ -334,10 +343,12 @@ async def run_dub_job(
         "--job-id", job_id,
         "--stage", "dub",
         "--voice-id", voice_id,
+        "--subtitle-source", subtitle_source,
         "--ocr-top", ocr_top,
         "--ocr-bottom", ocr_bottom,
         "--ocr-left", ocr_left,
         "--ocr-right", ocr_right,
+        "--background-music-volume", background_music_volume,
     ]
 
     exit_code, log_lines = await _run_job_and_wait(job_id, args)
@@ -360,6 +371,7 @@ async def run_dub_job(
 async def run_sub_only_job(
     input_video: UploadFile = File(...),
     output_bundle: UploadFile = File(...),
+    subtitle_source: str = Form(""),
     ocr_top: str = Form(""),
     ocr_bottom: str = Form(""),
     ocr_left: str = Form(""),
@@ -367,7 +379,8 @@ async def run_sub_only_job(
     duration_seconds: str = Form("300"),
 ):
     """Y hệt /jobs/dub nhưng chỉ burn sub, không TTS - cũng nhận output_bundle.zip
-    thay vì chỉ trans.srt (xem docstring /jobs/dub)."""
+    thay vì chỉ trans.srt, và cũng cần subtitle_source (xem docstring /jobs/dub -
+    _7_sub_into_vid.py cùng dùng use_ocr_crop_style, cùng lỗi mất crop/blur nếu thiếu)."""
     await _reserve_vram_slot_or_reject()
 
     job_id = uuid.uuid4().hex
@@ -393,6 +406,7 @@ async def run_sub_only_job(
         "--output", str(output_path),
         "--job-id", job_id,
         "--stage", "sub-only",
+        "--subtitle-source", subtitle_source,
         "--ocr-top", ocr_top,
         "--ocr-bottom", ocr_bottom,
         "--ocr-left", ocr_left,

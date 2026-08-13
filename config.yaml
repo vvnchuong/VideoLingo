@@ -19,7 +19,7 @@ api:
 max_workers: 2
 
 target_language: 'Tiếng Việt'
-subtitle_source: 'ocr'
+subtitle_source: 'whisper'
 
 demucs: false
 
@@ -33,8 +33,8 @@ whisper:
   language: 'zh'
   detected_language: 'zh'
   runtime: 'local'
-  whisperX_302_api_key: 'YOUR_WHISPERX_API_KEY'
-  elevenlabs_api_key: 'YOUR_ELEVENLABS_API_KEY'
+  whisperX_302_api_key: ''
+  elevenlabs_api_key: ''
 
 burn_subtitles: true
 
@@ -45,6 +45,8 @@ ffmpeg_gpu: true
 ffmpeg_threads: 4
 # (24GB -> 20000, 16GB -> ~13000, ...).
 vram_threshold_mb: 4000
+
+background_music_volume: 1.0
 
 youtube:
   cookies_path: ''
@@ -65,27 +67,27 @@ pause_before_translate: false
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: 'YOUR_FISH_TTS_API_KEY'
+  api_key: ''
   voice: 'anna'
   custom_name: ''
   voice_id: ''
   mode: "preset"
 
 openai_tts:
-  api_key: 'YOUR_OPENAI_API_KEY'
+  api_key: ''
   voice: 'alloy'
 
 azure_tts:
-  api_key: 'YOUR_AZURE_API_KEY'
+  api_key: ''
   voice: 'vi-VN-HoaiMyNeural'
 
 fish_tts:
-  api_key: 'YOUR_FISH_TTS_API_KEY'
+  api_key: ''
   character: ''
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: 'YOUR_COSYVOICE_API_KEY'
+  api_key: ''
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -95,7 +97,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: 'YOUR_302_API_KEY'
+  302_api: ''
 
 speed_factor:
   min: 1

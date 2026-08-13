@@ -31,17 +31,48 @@ TRANS_OUTLINE_COLOR = '&H000000'
 TRANS_OUTLINE_WIDTH = 1
 TRANS_BACK_COLOR = '&H33000000'
 
+# Xử lý nhạc nền trước khi mix: tăng nhẹ tốc độ + cao độ, lọc bớt tần số quá
+# trầm/quá cao. KHÔNG hạ volume ở đây nữa - giữ nguyên âm lượng gốc, việc giảm
+# âm lượng (nếu có) do background_music_volume trong config.yaml quyết định.
+BG_AUDIO_PREFILTER = (
+    "atempo=1.04,asetrate=44100*1.02,aresample=44100,"
+    "highpass=f=100,lowpass=f=15000"
+)
+
+
+def _build_audio_filter(background_music_volume: float) -> str:
+    """Trộn giọng dub với nhạc nền gốc theo đúng % âm lượng chỉ định (0.0-1.0):
+    0 = xoá hoàn toàn (bỏ hẳn input background, không mix gì), 1.0 = giữ nguyên như
+    cũ, giá trị giữa (vd 0.05) = giảm âm lượng nhạc nền trước khi mix. Input index
+    đổi theo có background_file hay không - xem chỗ gọi cmd.extend ở
+    merge_video_audio(). Trước khi mix, nhạc nền luôn đi qua BG_AUDIO_PREFILTER
+    (tempo/pitch/EQ)."""
+    if background_music_volume <= 0:
+        return "[1:a]anull[a]"
+    if background_music_volume >= 1.0:
+        return (
+            f"[1:a]{BG_AUDIO_PREFILTER}[bg];"
+            f"[bg][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]"
+        )
+    return (
+        f"[1:a]{BG_AUDIO_PREFILTER},volume={background_music_volume}[bg_reduced];"
+        f"[bg_reduced][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]"
+    )
+
 
 def merge_video_audio():
     """Merge video and audio, and reduce video volume"""
     VIDEO_FILE = find_video_files()
     background_file = _BACKGROUND_AUDIO_FILE
+    try:
+        background_music_volume = float(load_key("background_music_volume"))
+    except KeyError:
+        background_music_volume = 1.0
 
     if not load_key("burn_subtitles"):
         rprint(
             "[bold yellow]Warning: A 0-second black video will be generated as a placeholder as subtitles are not burned in.[/bold yellow]")
 
-        # Create a black frame
         frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(DUB_VIDEO, fourcc, 1, (1920, 1080))
@@ -51,11 +82,9 @@ def merge_video_audio():
         rprint("[bold green]Placeholder video has been generated.[/bold green]")
         return
 
-    # Normalize dub audio
     normalized_dub_audio = 'output/normalized_dub.wav'
     normalize_audio_volume(DUB_AUDIO, normalized_dub_audio)
 
-    # Merge video and audio with translated subtitles
     video = cv2.VideoCapture(VIDEO_FILE)
     TARGET_WIDTH = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -99,11 +128,9 @@ def merge_video_audio():
             f"[withblur]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
             f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
             f"{subtitle_filter}[v];"
-            f"[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]"
+            + _build_audio_filter(background_music_volume)
         )
     else:
-        # Hành vi CŨ, giữ nguyên y hệt trước - áp dụng cho Whisper hoặc OCR không
-        # có vùng crop tuỳ chỉnh.
         subtitle_filter = (
             f"subtitles={dub_sub_file_escaped}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
             f"force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'"
@@ -112,20 +139,21 @@ def merge_video_audio():
             f'[0:v]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,'
             f'pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,'
             f'{subtitle_filter}[v];'
-            f'[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=3:normalize=0[a]'
+            + _build_audio_filter(background_music_volume)
         )
 
     cmd = [
-        'ffmpeg', '-y', '-i', VIDEO_FILE, '-i', background_file, '-i', normalized_dub_audio,
-        '-filter_complex', filter_complex,
+        'ffmpeg', '-y', '-i', VIDEO_FILE,
     ]
+    if background_music_volume > 0:
+        cmd.extend(['-i', background_file])
+    cmd.extend(['-i', normalized_dub_audio, '-filter_complex', filter_complex])
 
     if load_key("ffmpeg_gpu"):
         rprint("[bold green]Using GPU acceleration...[/bold green]")
         cmd.extend(['-map', '[v]', '-map', '[a]', '-c:v', 'h264_nvenc'])
     else:
         cmd.extend(['-map', '[v]', '-map', '[a]'])
-        # limit ffmpeg thread count
         ffmpeg_threads = load_key("ffmpeg_threads")
         if ffmpeg_threads and ffmpeg_threads > 0:
             cmd.extend(['-threads', str(ffmpeg_threads)])
