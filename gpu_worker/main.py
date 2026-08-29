@@ -198,6 +198,89 @@ def _logs_header(log_lines: list[str]) -> str:
     return json.dumps(tail, ensure_ascii=True)
 
 
+# --- SUB stage: đổi sang async (submit -> poll status -> lấy result riêng) ---
+# LÝ DO ĐỔI: mỗi request /jobs/sub trước đây giữ HTTP connection mở suốt cả pipeline
+# (transcribe+dịch có thể mất vài phút). Khi traffic đi qua Cloudflare Tunnel (đang
+# dùng cho test local qua gpu.aidub.tech), Cloudflare có giới hạn CỨNG 100 giây cho
+# mỗi request/response - job nào chạy quá 100s bị Cloudflare tự cắt và trả lỗi 524,
+# dù bản thân job vẫn tiếp tục chạy xong bình thường ở phía dưới (không liên quan gì
+# tới lỗi thật của job). Việc tách submit/poll áp dụng đúng pattern đã dùng cho
+# /download-video trước đó.
+#
+# LƯU Ý (đã bàn trước đây, giữ lại cho lần đọc sau): pattern submit/poll này CHỈ an
+# toàn khi job luôn nằm cố định trên CÙNG một máy GPU vật lý (đúng trường hợp hiện
+# tại: 1 máy Windows local duy nhất). Nếu sau này chuyển sang Vast.ai Serverless
+# (routing không sticky - mỗi request có thể rơi vào instance khác nhau), pattern
+# này sẽ cần thiết kế lại (ví dụ dùng shared storage cho job state, hoặc quay lại
+# đồng bộ). Chưa cần lo việc đó bây giờ - đang test local.
+
+_sub_jobs: dict[str, dict] = {}  # job_id -> {"status": "PENDING"|"DONE"|"FAILED", "logs": [...], "exit_code": int|None, "error": str|None}
+
+
+async def _run_sub_job_background(
+    job_id: str,
+    workdir: Path,
+    subtitle_source: str,
+    source_lang: str,
+    ocr_top: str,
+    ocr_bottom: str,
+    ocr_left: str,
+    ocr_right: str,
+    subtitle_position_top: str,
+    subtitle_position_bottom: str,
+):
+    args = [
+        "--input", str(next(workdir.glob("input.*"))),
+        "--job-id", job_id,
+        "--stage", "sub",
+        "--subtitle-source", subtitle_source,
+        "--source-lang", source_lang,
+        "--ocr-top", ocr_top,
+        "--ocr-bottom", ocr_bottom,
+        "--ocr-left", ocr_left,
+        "--ocr-right", ocr_right,
+        "--subtitle-position-top", subtitle_position_top,
+        "--subtitle-position-bottom", subtitle_position_bottom,
+    ]
+
+    try:
+        exit_code, log_lines = await _run_job_and_wait(job_id, args)
+
+        if exit_code != 0:
+            _sub_jobs[job_id] = {
+                "status": "FAILED", "logs": log_lines[-50:], "exit_code": exit_code,
+                "error": "SUB stage failed",
+            }
+            _cleanup_workdir(job_id)
+            return
+
+        # Video KHÔNG zip chung (không có lợi ích nén thêm cho mp4 đã nén sẵn) -
+        # tách route riêng /jobs/{job_id}/video, giống thiết kế cũ.
+        # QUAN TRỌNG: KHÔNG loại trừ "audio" - stage dub sau này cần audio/raw.mp3
+        # đã demucs từ bước sub này (xem comment gốc, đã gặp lỗi LoadAudioError
+        # thật khi thiếu file này).
+        zip_dir = workdir / "sub_result_files"
+        if zip_dir.exists():
+            shutil.rmtree(zip_dir)
+        shutil.copytree(
+            workdir / "output", zip_dir,
+            ignore=shutil.ignore_patterns("*.mp4"),
+        )
+        zip_base = workdir / "sub_result"
+        shutil.make_archive(str(zip_base), "zip", str(zip_dir))
+        shutil.rmtree(zip_dir)
+
+        _sub_jobs[job_id] = {
+            "status": "DONE", "logs": log_lines[-50:], "exit_code": 0, "error": None,
+        }
+    except Exception as e:
+        print(f"[job {job_id}] Loi khong luong truoc duoc trong background task: {e}", flush=True)
+        _sub_jobs[job_id] = {
+            "status": "FAILED", "logs": [], "exit_code": None, "error": str(e),
+        }
+        _cleanup_workdir(job_id)
+
+
 @app.post("/jobs/sub")
 async def run_sub_job(
     input_video: UploadFile = File(...),
@@ -207,6 +290,8 @@ async def run_sub_job(
     ocr_bottom: str = Form(""),
     ocr_left: str = Form(""),
     ocr_right: str = Form(""),
+    subtitle_position_top: str = Form(""),
+    subtitle_position_bottom: str = Form(""),
     duration_seconds: str = Form("300"),  # đọc bởi workload_calculator trong worker.py
 ):
     await _reserve_vram_slot_or_reject()
@@ -218,56 +303,50 @@ async def run_sub_job(
     input_path = workdir / f"input{input_ext}"
     await _save_upload(input_video, input_path)
 
-    args = [
-        "--input", str(input_path),
-        "--job-id", job_id,
-        "--stage", "sub",
-        "--subtitle-source", subtitle_source,
-        "--source-lang", source_lang,
-        "--ocr-top", ocr_top,
-        "--ocr-bottom", ocr_bottom,
-        "--ocr-left", ocr_left,
-        "--ocr-right", ocr_right,
-    ]
+    _sub_jobs[job_id] = {"status": "PENDING", "logs": [], "exit_code": None, "error": None}
 
-    exit_code, log_lines = await _run_job_and_wait(job_id, args)
+    # Chạy nền - KHÔNG await ở đây, để request trả về ngay lập tức (tránh giữ
+    # connection mở qua Cloudflare quá 100s). Java sẽ poll GET /jobs/sub/{job_id}/status.
+    asyncio.create_task(_run_sub_job_background(
+        job_id, workdir, subtitle_source, source_lang,
+        ocr_top, ocr_bottom, ocr_left, ocr_right,
+        subtitle_position_top, subtitle_position_bottom,
+    ))
 
-    if exit_code != 0:
-        headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": str(exit_code)}
-        _cleanup_workdir(job_id)
-        raise HTTPException(500, detail="SUB stage failed", headers=headers)
+    return {"job_id": job_id, "status": "PENDING"}
 
-    # Video KHÔNG zip chung (zip không nén thêm được gì cho file đã nén sẵn như
-    # mp4, chỉ tốn thời gian vô ích) - trả qua route RIÊNG (/jobs/{job_id}/video),
-    # Java tải 2 lần: 1 lần lấy zip (text/json), 1 lần lấy video. workdir CHƯA bị
-    # dọn ở đây - chỉ dọn sau khi CẢ 2 lần tải đều xong (xem
-    # /jobs/{job_id}/video bên dưới).
-    # QUAN TRỌNG: KHÔNG loại trừ "audio" - Java cần audio/ (đặc biệt raw.mp3 đã
-    # demucs) để gửi lại khi bấm Dub sau đó (xem GpuWorkerClient.zipOutputDir() -
-    # đã gặp lỗi thật: thiếu audio/ khiến demucs_audio() ở stage dub báo
-    # LoadAudioError vì raw.mp3 không tồn tại, dù đã tách sẵn từ lần sub này).
-    zip_dir = workdir / "sub_result_files"
-    if zip_dir.exists():
-        shutil.rmtree(zip_dir)
-    shutil.copytree(
-        workdir / "output", zip_dir,
-        ignore=shutil.ignore_patterns("*.mp4"),
-    )
-    zip_base = workdir / "sub_result"
-    zip_path = shutil.make_archive(str(zip_base), "zip", str(zip_dir))
-    # Dọn ngay bản copy tạm SAU KHI nén xong - trước đây bỏ sót bước này, để lại
-    # rác trùng lặp với output/ trên đĩa GPU (cậu đã phát hiện: output_sub.mp4 tồn
-    # tại 2 lần trên đĩa GPU do bản chạy CODE CŨ chưa loại trừ *.mp4 lúc copytree -
-    # bản code hiện tại đã loại trừ đúng ở dòng ignore_patterns phía trên, dòng
-    # rmtree này thêm 1 lớp an toàn dọn dẹp, không phụ thuộc vào đúng bản code nào).
-    shutil.rmtree(zip_dir)
 
-    headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": "0", "X-Job-Id": job_id}
+@app.get("/jobs/sub/{job_id}/status")
+async def get_sub_job_status(job_id: str):
+    """Java poll endpoint này (vài giây/lần) tới khi status khác PENDING."""
+    state = _sub_jobs.get(job_id)
+    if state is None:
+        raise HTTPException(404, f"Không tìm thấy sub job_id={job_id}")
+    return {
+        "job_id": job_id,
+        "status": state["status"],
+        "logs": state["logs"],
+        "exit_code": state["exit_code"],
+        "error": state["error"],
+    }
+
+
+@app.get("/jobs/sub/{job_id}/result")
+async def get_sub_job_result(job_id: str):
+    """Java gọi khi status=DONE để lấy zip (trans.srt + audio/...). Giữ đúng tên
+    file/media-type như FileResponse cũ để không phải đổi cách Java giải nén."""
+    state = _sub_jobs.get(job_id)
+    if state is None or state["status"] != "DONE":
+        raise HTTPException(404, f"sub job_id={job_id} chưa xong hoặc không tồn tại")
+
+    zip_path = _job_workdir(job_id) / "sub_result.zip"
+    if not zip_path.exists():
+        raise HTTPException(404, f"Không tìm thấy sub_result.zip cho job_id={job_id}")
+
     return FileResponse(
         zip_path, filename="sub_result.zip", media_type="application/zip",
-        headers=headers,
         # KHÔNG cleanup ở đây nữa - job_id vẫn cần sống tới khi Java gọi tiếp
-        # GET /jobs/{job_id}/video để lấy video, mới thật sự dọn.
+        # GET /jobs/{job_id}/video để lấy video, mới thật sự dọn (giống thiết kế cũ).
     )
 
 
@@ -285,6 +364,52 @@ async def get_sub_video(job_id: str):
     )
 
 
+_dub_jobs: dict[str, dict] = {}  # cùng cấu trúc _sub_jobs
+
+
+async def _run_dub_job_background(job_id: str, workdir: Path, output_path: Path,
+                                   voice_id: str, subtitle_source: str,
+                                   ocr_top: str, ocr_bottom: str, ocr_left: str, ocr_right: str,
+                                   subtitle_position_top: str, subtitle_position_bottom: str,
+                                   background_music_volume: str, subtitle_style: str):
+    args = [
+        "--output", str(output_path),
+        "--job-id", job_id,
+        "--stage", "dub",
+        "--voice-id", voice_id,
+        "--subtitle-source", subtitle_source,
+        "--ocr-top", ocr_top,
+        "--ocr-bottom", ocr_bottom,
+        "--ocr-left", ocr_left,
+        "--ocr-right", ocr_right,
+        "--subtitle-position-top", subtitle_position_top,
+        "--subtitle-position-bottom", subtitle_position_bottom,
+        "--background-music-volume", background_music_volume,
+        "--subtitle-style", subtitle_style,
+    ]
+
+    try:
+        exit_code, log_lines = await _run_job_and_wait(job_id, args)
+
+        if exit_code != 0:
+            _dub_jobs[job_id] = {
+                "status": "FAILED", "logs": log_lines[-50:], "exit_code": exit_code,
+                "error": "DUB stage failed",
+            }
+            _cleanup_workdir(job_id)
+            return
+
+        _dub_jobs[job_id] = {
+            "status": "DONE", "logs": log_lines[-50:], "exit_code": 0, "error": None,
+        }
+    except Exception as e:
+        print(f"[job {job_id}] Loi khong luong truoc duoc trong background task: {e}", flush=True)
+        _dub_jobs[job_id] = {
+            "status": "FAILED", "logs": [], "exit_code": None, "error": str(e),
+        }
+        _cleanup_workdir(job_id)
+
+
 @app.post("/jobs/dub")
 async def run_dub_job(
     input_video: UploadFile = File(...),
@@ -295,13 +420,16 @@ async def run_dub_job(
     ocr_bottom: str = Form(""),
     ocr_left: str = Form(""),
     ocr_right: str = Form(""),
+    subtitle_position_top: str = Form(""),
+    subtitle_position_bottom: str = Form(""),
     background_music_volume: str = Form(""),
+    subtitle_style: str = Form(""),
     duration_seconds: str = Form("300"),
 ):
     """Nhận LẠI video gốc + output_bundle.zip (chứa TOÀN BỘ output/ từ lần /jobs/sub
     trước, đã qua tay user sửa trên FE) - KHÔNG giả định workdir cũ còn tồn tại (xem
     docstring đầu file). QUAN TRỌNG: KHÔNG chỉ gửi trans.srt - lỗi thật đã gặp:
-    zh_gen_audio_tasks() (pipeline ZH) đọc output/log/zh_sync.json, không phải
+    src_gen_audio_tasks() (nhánh OCR, core/ocr_lines.py) đọc output/log/src_sync.json, không phải
     trans.srt, và có thể còn file khác cần tùy pipeline. Gửi cả bundle (giống hệt
     cách /jobs/sub trả về) để không phải đoán/liệt kê từng file.
 
@@ -310,7 +438,10 @@ async def run_dub_job(
     trước, vì mỗi request /jobs/* độc lập hoàn toàn - bản chất serverless). Thiếu
     tham số này, _12_dub_to_vid.py đọc subtitle_source rỗng -> use_ocr_crop_style
     luôn False -> MẤT crop/blur cho video OCR (lỗi thật đã gặp: dub video OCR
-    không blur, sub rơi về vị trí mặc định như Whisper)."""
+    không blur, sub rơi về vị trí mặc định như Whisper).
+
+    ĐỔI SANG ASYNC (submit/poll) - cùng lý do với /jobs/sub: tránh giữ HTTP
+    connection mở quá 100s qua Cloudflare Tunnel khi dub chạy lâu."""
     await _reserve_vram_slot_or_reject()
 
     job_id = uuid.uuid4().hex
@@ -338,33 +469,91 @@ async def run_dub_job(
 
     output_path = workdir / "output" / "output_dub.mp4"
 
+    _dub_jobs[job_id] = {"status": "PENDING", "logs": [], "exit_code": None, "error": None}
+
+    asyncio.create_task(_run_dub_job_background(
+        job_id, workdir, output_path, voice_id, subtitle_source,
+        ocr_top, ocr_bottom, ocr_left, ocr_right,
+        subtitle_position_top, subtitle_position_bottom,
+        background_music_volume, subtitle_style,
+    ))
+
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/jobs/dub/{job_id}/status")
+async def get_dub_job_status(job_id: str):
+    state = _dub_jobs.get(job_id)
+    if state is None:
+        raise HTTPException(404, f"Không tìm thấy dub job_id={job_id}")
+    return {
+        "job_id": job_id,
+        "status": state["status"],
+        "logs": state["logs"],
+        "exit_code": state["exit_code"],
+        "error": state["error"],
+    }
+
+
+@app.get("/jobs/dub/{job_id}/result")
+async def get_dub_job_result(job_id: str):
+    """Java gọi khi status=DONE để lấy video dub - chỉ 1 file, không cần zip."""
+    state = _dub_jobs.get(job_id)
+    if state is None or state["status"] != "DONE":
+        raise HTTPException(404, f"dub job_id={job_id} chưa xong hoặc không tồn tại")
+
+    output_path = _job_workdir(job_id) / "output" / "output_dub.mp4"
+    if not output_path.exists():
+        raise HTTPException(404, f"Không tìm thấy output_dub.mp4 cho job_id={job_id}")
+
+    return FileResponse(
+        output_path, filename="output_dub.mp4", media_type="video/mp4",
+        background=BackgroundTask(_cleanup_workdir, job_id),
+    )
+
+
+_sub_only_jobs: dict[str, dict] = {}  # cùng cấu trúc _sub_jobs / _dub_jobs
+
+
+async def _run_sub_only_job_background(job_id: str, workdir: Path, output_path: Path,
+                                        subtitle_source: str,
+                                        ocr_top: str, ocr_bottom: str, ocr_left: str, ocr_right: str,
+                                        subtitle_position_top: str, subtitle_position_bottom: str,
+                                        subtitle_style: str):
     args = [
         "--output", str(output_path),
         "--job-id", job_id,
-        "--stage", "dub",
-        "--voice-id", voice_id,
+        "--stage", "sub-only",
         "--subtitle-source", subtitle_source,
         "--ocr-top", ocr_top,
         "--ocr-bottom", ocr_bottom,
         "--ocr-left", ocr_left,
         "--ocr-right", ocr_right,
-        "--background-music-volume", background_music_volume,
+        "--subtitle-position-top", subtitle_position_top,
+        "--subtitle-position-bottom", subtitle_position_bottom,
+        "--subtitle-style", subtitle_style,
     ]
 
-    exit_code, log_lines = await _run_job_and_wait(job_id, args)
+    try:
+        exit_code, log_lines = await _run_job_and_wait(job_id, args)
 
-    if exit_code != 0:
-        headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": str(exit_code)}
+        if exit_code != 0:
+            _sub_only_jobs[job_id] = {
+                "status": "FAILED", "logs": log_lines[-50:], "exit_code": exit_code,
+                "error": "SUB-ONLY stage failed",
+            }
+            _cleanup_workdir(job_id)
+            return
+
+        _sub_only_jobs[job_id] = {
+            "status": "DONE", "logs": log_lines[-50:], "exit_code": 0, "error": None,
+        }
+    except Exception as e:
+        print(f"[job {job_id}] Loi khong luong truoc duoc trong background task: {e}", flush=True)
+        _sub_only_jobs[job_id] = {
+            "status": "FAILED", "logs": [], "exit_code": None, "error": str(e),
+        }
         _cleanup_workdir(job_id)
-        raise HTTPException(500, detail="DUB stage failed", headers=headers)
-
-    # Chỉ 1 file (video dub) - trả trực tiếp bằng FileResponse, không cần zip như /jobs/sub.
-    headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": "0"}
-    return FileResponse(
-        output_path, filename="output_dub.mp4", media_type="video/mp4",
-        headers=headers,
-        background=BackgroundTask(_cleanup_workdir, job_id),
-    )
 
 
 @app.post("/jobs/sub-only")
@@ -376,11 +565,16 @@ async def run_sub_only_job(
     ocr_bottom: str = Form(""),
     ocr_left: str = Form(""),
     ocr_right: str = Form(""),
+    subtitle_position_top: str = Form(""),
+    subtitle_position_bottom: str = Form(""),
+    subtitle_style: str = Form(""),
     duration_seconds: str = Form("300"),
 ):
     """Y hệt /jobs/dub nhưng chỉ burn sub, không TTS - cũng nhận output_bundle.zip
     thay vì chỉ trans.srt, và cũng cần subtitle_source (xem docstring /jobs/dub -
-    _7_sub_into_vid.py cùng dùng use_ocr_crop_style, cùng lỗi mất crop/blur nếu thiếu)."""
+    _7_sub_into_vid.py cùng dùng use_ocr_crop_style, cùng lỗi mất crop/blur nếu thiếu).
+
+    ĐỔI SANG ASYNC (submit/poll) - cùng lý do với /jobs/sub và /jobs/dub."""
     await _reserve_vram_slot_or_reject()
 
     job_id = uuid.uuid4().hex
@@ -402,27 +596,189 @@ async def run_sub_only_job(
 
     output_path = workdir / "output" / "output_sub.mp4"
 
-    args = [
+    _sub_only_jobs[job_id] = {"status": "PENDING", "logs": [], "exit_code": None, "error": None}
+
+    asyncio.create_task(_run_sub_only_job_background(
+        job_id, workdir, output_path, subtitle_source,
+        ocr_top, ocr_bottom, ocr_left, ocr_right,
+        subtitle_position_top, subtitle_position_bottom,
+        subtitle_style,
+    ))
+
+    return {"job_id": job_id, "status": "PENDING"}
+
+
+@app.get("/jobs/sub-only/{job_id}/status")
+async def get_sub_only_job_status(job_id: str):
+    state = _sub_only_jobs.get(job_id)
+    if state is None:
+        raise HTTPException(404, f"Không tìm thấy sub-only job_id={job_id}")
+    return {
+        "job_id": job_id,
+        "status": state["status"],
+        "logs": state["logs"],
+        "exit_code": state["exit_code"],
+        "error": state["error"],
+    }
+
+
+@app.get("/jobs/sub-only/{job_id}/result")
+async def get_sub_only_job_result(job_id: str):
+    """Java gọi khi status=DONE để lấy video sub-only - chỉ 1 file, không cần zip."""
+    state = _sub_only_jobs.get(job_id)
+    if state is None or state["status"] != "DONE":
+        raise HTTPException(404, f"sub-only job_id={job_id} chưa xong hoặc không tồn tại")
+
+    output_path = _job_workdir(job_id) / "output" / "output_sub.mp4"
+    if not output_path.exists():
+        raise HTTPException(404, f"Không tìm thấy output_sub.mp4 cho job_id={job_id}")
+
+    return FileResponse(
+        output_path, filename="output_sub.mp4", media_type="video/mp4",
+        background=BackgroundTask(_cleanup_workdir, job_id),
+    )
+
+
+@app.post("/download-video")
+async def download_video(url: str = Form(...)):
+    """Endpoint mới - thay thế việc Java tự gọi ProcessBuilder chạy download_video.py
+    trực tiếp (không còn khả thi khi Java chạy trong Docker container trên VPS,
+    khác OS/filesystem với máy GPU chạy Windows). Logic tải giữ NGUYÊN, chỉ đổi
+    cách gọi: HTTP thay vì subprocess trực tiếp từ Java.
+
+    Dùng lại đúng script download_video.py hiện có (wrapper quanh
+    core/_1_ytdlp.py, xử lý cả nhánh Douyin qua Playwright) - không viết lại
+    logic tải, tránh trùng công và dễ sai (đặc biệt Douyin cần cookie/Playwright).
+    """
+    job_id = uuid.uuid4().hex
+    workdir = _job_workdir(job_id)
+    workdir.mkdir(parents=True, exist_ok=True)
+    output_path = workdir / "downloaded_video.mp4"
+
+    cmd = [
+        PYTHON_EXECUTABLE, str(Path(VIDEOLINGO_DIR) / "download_video.py"),
+        "--url", url,
         "--output", str(output_path),
-        "--job-id", job_id,
-        "--stage", "sub-only",
-        "--subtitle-source", subtitle_source,
-        "--ocr-top", ocr_top,
-        "--ocr-bottom", ocr_bottom,
-        "--ocr-left", ocr_left,
-        "--ocr-right", ocr_right,
     ]
 
-    exit_code, log_lines = await _run_job_and_wait(job_id, args)
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
 
-    if exit_code != 0:
+    process = await asyncio.create_subprocess_exec(
+        *cmd, cwd=VIDEOLINGO_DIR,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+    )
+
+    log_lines: list[str] = []
+    assert process.stdout is not None
+    async for raw_line in process.stdout:
+        line = raw_line.decode("utf-8", errors="replace").rstrip()
+        print(f"[download {job_id}] {line}", flush=True)
+        log_lines.append(line)
+
+    exit_code = await process.wait()
+
+    if exit_code != 0 or not output_path.exists():
         headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": str(exit_code)}
-        _cleanup_workdir(job_id)
-        raise HTTPException(500, detail="SUB-ONLY stage failed", headers=headers)
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, detail="Download video failed", headers=headers)
 
     headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": "0"}
     return FileResponse(
-        output_path, filename="output_sub.mp4", media_type="video/mp4",
+        output_path, filename="downloaded_video.mp4", media_type="video/mp4",
+        headers=headers,
+        background=BackgroundTask(_cleanup_workdir, job_id),
+    )
+
+
+async def _run_tts_script(cli_script: str, args: list[str]) -> tuple[int, list[str]]:
+    """Helper chung cho 2 endpoint TTS bên dưới - cả 2 đều chạy 1 trong 2 file
+    CLI có sẵn (tts_cli.py / vieneu_cli.py) trong VIDEOLINGO_DIR, y hệt cách
+    TtsService.java cũ dùng ProcessBuilder, chỉ khác nơi gọi (HTTP thay vì
+    subprocess trực tiếp từ Java)."""
+    cmd = [PYTHON_EXECUTABLE, str(Path(VIDEOLINGO_DIR) / cli_script)] + args
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd, cwd=VIDEOLINGO_DIR,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
+    )
+
+    log_lines: list[str] = []
+    assert process.stdout is not None
+    async for raw_line in process.stdout:
+        line = raw_line.decode("utf-8", errors="replace").rstrip()
+        print(f"[tts] {line}", flush=True)
+        log_lines.append(line)
+
+    exit_code = await process.wait()
+    return exit_code, log_lines
+
+
+@app.post("/tts/generate")
+async def tts_generate(
+    text: str = Form(...),
+    voice_id: str = Form(...),
+    cli_script: str = Form(...),  # "tts_cli.py" hoặc "vieneu_cli.py" - Java quyết định
+    rate: str | None = Form(None),
+):
+    job_id = uuid.uuid4().hex
+    workdir = _job_workdir(job_id)
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    text_file = workdir / "tts_text.txt"
+    text_file.write_text(text, encoding="utf-8")
+    output_path = workdir / "output.mp3"
+
+    args = [
+        "--text-file", str(text_file),
+        "--voice", voice_id,
+        "--output", str(output_path),
+    ]
+    if rate:
+        args += ["--rate", rate]
+
+    exit_code, log_lines = await _run_tts_script(cli_script, args)
+
+    if exit_code != 0 or not output_path.exists():
+        headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": str(exit_code)}
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, detail="TTS generate failed", headers=headers)
+
+    headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": "0"}
+    return FileResponse(
+        output_path, filename="output.mp3", media_type="audio/mpeg",
+        headers=headers,
+        background=BackgroundTask(_cleanup_workdir, job_id),
+    )
+
+
+@app.post("/tts/voice-sample")
+async def tts_voice_sample(
+    text: str = Form(...),
+    voice_id: str = Form(...),
+    cli_script: str = Form(...),
+):
+    job_id = uuid.uuid4().hex
+    workdir = _job_workdir(job_id)
+    workdir.mkdir(parents=True, exist_ok=True)
+    output_path = workdir / "sample.mp3"
+
+    args = ["--text", text, "--voice", voice_id, "--output", str(output_path)]
+    exit_code, log_lines = await _run_tts_script(cli_script, args)
+
+    if exit_code != 0 or not output_path.exists():
+        headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": str(exit_code)}
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise HTTPException(500, detail="TTS voice sample failed", headers=headers)
+
+    headers = {"X-Job-Logs": _logs_header(log_lines), "X-Exit-Code": "0"}
+    return FileResponse(
+        output_path, filename="sample.mp3", media_type="audio/mpeg",
         headers=headers,
         background=BackgroundTask(_cleanup_workdir, job_id),
     )

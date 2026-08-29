@@ -118,7 +118,7 @@ def _get_text_steps():
         _lang = "en"
 
     if _lang == "zh":
-        from core.zh_pipeline import zh_asr_and_translate
+        from core.ocr_lines import zh_asr_and_translate
         return [
             (t("ZH: VAD + Whisper clip + Gemini duration-aware translate"),
              zh_asr_and_translate),
@@ -210,7 +210,7 @@ def _get_audio_steps():
         _lang = "en"
 
     if _lang == "zh":
-        from core.zh_pipeline import zh_gen_audio_tasks
+        from core.ocr_lines import zh_gen_audio_tasks
         return [
             # zh_gen_audio_tasks() đã tự set đúng cột 'lines'/'src_lines' (dùng _split_text_for_sub) —
             # KHÔNG gọi _8_2_dub_chunks.gen_dub_chunks() nữa vì hàm đó dò lại lines bằng cách khớp

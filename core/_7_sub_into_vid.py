@@ -1,43 +1,202 @@
 import os, subprocess, time
-from core._1_ytdlp import find_video_files
 import cv2
 import numpy as np
 import platform
+import re
+from PIL import Image, ImageDraw, ImageFont
+from core._1_ytdlp import find_video_files
 from core.utils import *
+from core.subtitle_style_presets import get_subtitle_style_colors, DEFAULT_SUBTITLE_STYLE
 
 SRC_FONT_SIZE = 15
 TRANS_FONT_SIZE = 17
-FONT_NAME = 'Arial'
-TRANS_FONT_NAME = 'Arial'
-
-# Linux need to install google noto fonts: apt-get install fonts-noto
-if platform.system() == 'Linux':
-    FONT_NAME = 'NotoSansCJK-Regular'
-    TRANS_FONT_NAME = 'NotoSansCJK-Regular'
-# Mac OS has different font names
-elif platform.system() == 'Darwin':
-    FONT_NAME = 'Arial Unicode MS'
-    TRANS_FONT_NAME = 'Arial Unicode MS'
-
-SRC_FONT_COLOR = '&HFFFFFF'
-SRC_OUTLINE_COLOR = '&H000000'
-SRC_OUTLINE_WIDTH = 1
-SRC_SHADOW_COLOR = '&H80000000'
-TRANS_FONT_COLOR = '&H00FFFF'
-TRANS_OUTLINE_COLOR = '&H000000'
-TRANS_OUTLINE_WIDTH = 1
-TRANS_BACK_COLOR = '&H33000000'
+FONT_NAME = 'arial.ttf'
+TRANS_FONT_NAME = 'arial.ttf'
 
 OUTPUT_DIR = "output"
 OUTPUT_VIDEO = f"{OUTPUT_DIR}/output_sub.mp4"
-SRC_SRT = f"{OUTPUT_DIR}/src.srt"
 TRANS_SRT = f"{OUTPUT_DIR}/trans.srt"
+CONCAT_TXT = f"{OUTPUT_DIR}/concat_subs.txt"
+SUBS_PNG_DIR = f"{OUTPUT_DIR}/subs_png"
+
+LEGACY_PLAYRES_HEIGHT = 288
+
+def _compute_ocr_margin_v(ocr_region: dict, target_height: int) -> int:
+    if ocr_region and "bottom" in ocr_region:
+        # Tính khoảng cách từ đáy vùng OCR đến đáy video
+        margin_bottom = target_height - int(ocr_region["bottom"] * target_height)
+        return margin_bottom
+    return 10
+
+
+def time_to_sec(t_str):
+    t_str = t_str.strip().replace(',', '.')
+    parts = t_str.split(':')
+    return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+
+
+def get_system_font(font_name, size):
+    try:
+        return ImageFont.truetype(font_name, size)
+    except IOError:
+        try:
+            return ImageFont.truetype("arial.ttf", size)
+        except IOError:
+            # Fallback for Mac/Linux
+            for f in ["/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                      "NotoSansCJK-Regular.ttc"]:
+                try:
+                    return ImageFont.truetype(f, size)
+                except IOError:
+                    continue
+    rprint("[bold red]CẢNH BÁO: Không tìm thấy font TTF chuẩn, đang dùng font mặc định (sẽ bị lỗi size)![/bold red]")
+    return ImageFont.load_default()
+
+
+def wrap_text(text, font, max_width, draw):
+    lines = []
+    for raw_line in text.split('\n'):
+        words = raw_line.split()
+        current_line = ""
+        for word in words:
+            test_line = f"{current_line} {word}".strip()
+            # Đo bề ngang của dòng chữ
+            if draw.textlength(test_line, font=font) <= max_width:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+    return "\n".join(lines)
+
+def _get_media_duration_sec(path: str) -> float:
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', path],
+            capture_output=True, text=True, timeout=15,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def generate_png_sequence(srt_path, target_w, target_h, font_size_legacy, style_mode, use_ocr, ocr_region, subtitle_position=None, total_duration_sec=0.0):
+    if not os.path.exists(srt_path):
+        return None
+
+    os.makedirs(SUBS_PNG_DIR, exist_ok=True)
+
+    # 1. Setup Màu sắc
+    if style_mode == "yellow_black":
+        text_color = (0, 0, 0, 255)
+        bg_color = (255, 215, 0, 255)
+    elif style_mode == "white_black":
+        text_color = (0, 0, 0, 255)
+        bg_color = (255, 255, 255, 255)
+    else:  # white_opaque
+        text_color = (255, 255, 255, 255)
+        bg_color = (0, 0, 0, 150)
+
+    real_font_size = int((font_size_legacy / LEGACY_PLAYRES_HEIGHT) * target_h)
+    font = get_system_font(TRANS_FONT_NAME, real_font_size)
+
+    # 3. Tính toán Tọa độ Tâm Y của Subtitle
+    if use_ocr:
+        center_y = int((ocr_region["top"] + ocr_region["bottom"]) / 2 * target_h)
+    elif subtitle_position and subtitle_position.get("top") is not None and subtitle_position.get("bottom") is not None:
+        center_y = int((subtitle_position["top"] + subtitle_position["bottom"]) / 2 * target_h)
+    else:
+        # Default: Căn cách đáy màn hình 12%
+        center_y = int(target_h - (target_h * 0.12))
+
+    # Tạo file ảnh rỗng (Blank)
+    blank_path = os.path.join(SUBS_PNG_DIR, "blank.png")
+    Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0)).save(blank_path)
+
+    # Đọc SRT
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    blocks = re.split(r'\n\s*\n', content.strip())
+    sub_data = []
+
+    for idx, block in enumerate(blocks):
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            time_line = lines[1]
+            text = "\n".join(lines[2:]).strip()  # Giữ nguyên cấu trúc xuống dòng
+
+            times = time_line.split(' --> ')
+            start_sec = time_to_sec(times[0])
+            end_sec = time_to_sec(times[1])
+
+            # --- RENDER ẢNH PNG ---
+            img = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(img)
+
+            # GIỚI HẠN CHIỀU RỘNG: Chữ chỉ được chiếm tối đa 90% chiều rộng màn hình
+            max_text_w = target_w * 0.90
+            wrapped_text = wrap_text(text, font, max_text_w, draw)
+
+            # Tính toán kích thước Box bọc trọn vẹn dựa trên text ĐÃ XUỐNG DÒNG
+            bbox = draw.multiline_textbbox((0, 0), wrapped_text, font=font, align="center")
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+
+            pad_x = int(real_font_size * 0.8)  # Padding ngang
+            pad_y = int(real_font_size * 0.5)  # Padding dọc
+            box_w = text_w + pad_x * 2
+            box_h = text_h + pad_y * 2
+
+            box_x1 = (target_w - box_w) // 2
+            box_y1 = center_y - (box_h // 2)
+            box_x2 = box_x1 + box_w
+            box_y2 = box_y1 + box_h
+
+            # VẼ HÌNH CHỮ NHẬT BO GÓC
+            radius = int(box_h * 0.2)
+            draw.rounded_rectangle([box_x1, box_y1, box_x2, box_y2], radius=radius, fill=bg_color)
+
+            # Viết chữ đè lên (nhớ truyền wrapped_text thay vì text gốc)
+            draw.multiline_text((target_w // 2, center_y), wrapped_text, font=font, fill=text_color, anchor="mm",
+                                align="center")
+
+            img_filename = f"sub_{idx}.png"
+            img.save(os.path.join(SUBS_PNG_DIR, img_filename))
+
+            sub_data.append({"start": start_sec, "end": end_sec, "file": img_filename})
+
+    # --- TẠO FILE KỊCH BẢN CONCAT DEMUXER CHO FFMPEG ---
+    with open(CONCAT_TXT, 'w', encoding='utf-8') as f:
+        f.write("ffconcat version 1.0\n")
+        current_time = 0.0
+
+        for sub in sub_data:
+            if sub["start"] > current_time:
+                f.write(f"file 'subs_png/blank.png'\n")
+                f.write(f"duration {sub['start'] - current_time:.3f}\n")
+
+            f.write(f"file 'subs_png/{sub['file']}'\n")
+            f.write(f"duration {sub['end'] - sub['start']:.3f}\n")
+            current_time = sub["end"]
+
+        remaining = total_duration_sec - current_time
+        if remaining > 0.01:
+            f.write(f"file 'subs_png/blank.png'\n")
+            f.write(f"duration {remaining:.3f}\n")
+            f.write(f"file 'subs_png/blank.png'\n")
+        else:
+            f.write(f"file 'subs_png/blank.png'\n")
+
+    return CONCAT_TXT
+
 
 def _compute_safe_blur_strength(crop_w: int, crop_h: int) -> str:
     max_radius = max(3, min(20, min(crop_w, crop_h) * 4 // 10))
     chroma_radius = min(max_radius, 9)
     return f"{max_radius}:5:{chroma_radius}:5"
-LEGACY_PLAYRES_HEIGHT = 288
 
 
 def _region_to_pixels(region: dict, target_width: int, target_height: int):
@@ -50,186 +209,91 @@ def _region_to_pixels(region: dict, target_width: int, target_height: int):
     return x1, y1, w, h
 
 
-def _region_center_y_ratio(region: dict) -> float:
-    return (region["top"] + region["bottom"]) / 2
-
-
-def _compute_ocr_margin_v(target_height: int, region: dict, font_size: int) -> int:
-    line_height = font_size * 1.3
-    center_crop_ratio = _region_center_y_ratio(region)  # 0.0-1.0
-    center_crop_y_virtual = LEGACY_PLAYRES_HEIGHT * center_crop_ratio
-    bottom_of_first_line = center_crop_y_virtual + line_height / 2
-    margin_v = LEGACY_PLAYRES_HEIGHT - bottom_of_first_line
-    return max(0, round(margin_v))
-
-
-def _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style,
-                                margin_v_probe, use_original_size=False):
-    probe_srt = os.path.join(OUTPUT_DIR, "_probe.srt")
-    probe_png = os.path.join(OUTPUT_DIR, "_probe.png")
-    with open(probe_srt, "w", encoding="utf-8") as f:
-        f.write("1\n00:00:00,000 --> 00:00:05,000\nA\n")
-
-    probe_srt_escaped = probe_srt.replace("\\", "/").replace(":", "\\:")
-    original_size_part = f":original_size={target_width}x{target_height}" if use_original_size else ""
-
-    cmd = [
-        'ffmpeg', '-y', '-i', video_file,
-        '-vf', (
-            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
-            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={probe_srt_escaped}{original_size_part}:"
-            f"force_style='{subtitles_style},Alignment=2,MarginV={margin_v_probe}'"
-        ).encode('utf-8'),
-        '-frames:v', '1', '-update', '1', probe_png,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if not os.path.exists(probe_png):
-        print(f"[probe-debug] ffmpeg stderr: {result.stderr[-800:]}", flush=True)
-
-    img = cv2.imread(probe_png)
-    os.remove(probe_srt)
-    if os.path.exists(probe_png):
-        os.remove(probe_png)
-    if img is None:
-        return None
-
-    b, g, r = img[:, :, 0].astype(int), img[:, :, 1].astype(int), img[:, :, 2].astype(int)
-    yellow_mask = (r > 180) & (g > 180) & (b < 120)
-    ys, _ = np.where(yellow_mask)
-    if len(ys) == 0:
-        return None
-    return int((ys.min() + ys.max()) / 2)
-
-
-def _compute_ocr_margin_v_by_measurement(video_file, target_width, target_height,
-                                          subtitles_style, region, use_original_size=False):
-    probe_margin_1, probe_margin_2 = 20, 200
-    y1 = _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style,
-                                     probe_margin_1, use_original_size)
-    y2 = _measure_subtitle_center_y(video_file, target_width, target_height, subtitles_style,
-                                     probe_margin_2, use_original_size)
-
-    target_y = int(target_height * _region_center_y_ratio(region))
-
-    if y1 is None or y2 is None or y1 == y2:
-        rprint("[bold yellow]Không đo được thực nghiệm vị trí sub, dùng công thức ước lượng dự phòng.[/bold yellow]")
-        return max(0, min(260, round((1 - _region_center_y_ratio(region)) * LEGACY_PLAYRES_HEIGHT)))
-
-    a = (y2 - y1) / (probe_margin_2 - probe_margin_1)
-    b = y1 - a * probe_margin_1
-    margin_v = (target_y - b) / a
-    return max(0, round(margin_v))
-
-
-def check_gpu_available():
-    try:
-        result = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
-        return 'h264_nvenc' in result.stdout
-    except:
-        return False
-
-
 def merge_subtitles_to_video():
     video_file = find_video_files()
     os.makedirs(os.path.dirname(OUTPUT_VIDEO), exist_ok=True)
 
-    # Check resolution
     if not load_key("burn_subtitles"):
-        rprint(
-            "[bold yellow]Warning: A 0-second black video will be generated as a placeholder as subtitles are not burned in.[/bold yellow]")
-
-        # Create a black frame
-        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, 1, (1920, 1080))
-        out.write(frame)
-        out.release()
-
-        rprint("[bold green]Placeholder video has been generated.[/bold green]")
         return
 
     if not os.path.exists(TRANS_SRT):
-        rprint("Subtitle files not found in the 'output' directory.")
+        rprint("Subtitle files not found.")
         exit(1)
 
     video = cv2.VideoCapture(video_file)
     TARGET_WIDTH = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
     TARGET_HEIGHT = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video.release()
+
     rprint(f"[bold green]Video resolution: {TARGET_WIDTH}x{TARGET_HEIGHT}[/bold green]")
 
     is_portrait = TARGET_HEIGHT > TARGET_WIDTH
-    trans_font_size = load_key("zh_pipeline.portrait_font_size") if is_portrait else TRANS_FONT_SIZE
-    if is_portrait:
-        rprint(f"[bold cyan]Video dọc (portrait) -> giảm font sub còn {trans_font_size}[/bold cyan]")
+    trans_font_size = load_key("src_pipeline.portrait_font_size") if is_portrait else TRANS_FONT_SIZE
 
     subtitle_source = load_key("subtitle_source")
     ocr_region = load_key("ocr_region")
-    use_ocr_crop_style = (
-        subtitle_source == "ocr" and ocr_region and ocr_region.get("bottom") is not None
-    )
+    use_ocr_crop_style = (subtitle_source == "ocr" and ocr_region and ocr_region.get("bottom") is not None)
 
-    subtitles_style = (
-        f"FontSize={trans_font_size},FontName={TRANS_FONT_NAME},"
-        f"PrimaryColour={TRANS_FONT_COLOR},OutlineColour={TRANS_OUTLINE_COLOR},"
-        f"OutlineWidth={TRANS_OUTLINE_WIDTH},BackColour={TRANS_BACK_COLOR},BorderStyle=4"
-    )
+    subtitle_position = None
+    if not use_ocr_crop_style:
+        try:
+            subtitle_position = load_key("subtitle_position")
+        except KeyError:
+            subtitle_position = None
+
+    try:
+        style_key = load_key("subtitle_style")
+    except KeyError:
+        style_key = 'yellow_black'
+
+    rprint(f"[bold green]🎨 Generating perfectly rounded PNG sequence...[/bold green]")
+    total_duration_sec = _get_media_duration_sec(video_file)
+    generate_png_sequence(TRANS_SRT, TARGET_WIDTH, TARGET_HEIGHT, trans_font_size, style_key, use_ocr_crop_style,
+                          ocr_region, subtitle_position, total_duration_sec)
+
+    # LỆNH FFMPEG (Overlay ảnh Subtitle lên Video gốc)
+    base_video_vf = f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
 
     if use_ocr_crop_style:
-        rprint(f"[bold cyan]OCR có vùng crop -> làm mờ vùng {ocr_region}, đưa sub lên giữa vùng đó[/bold cyan]")
         x1, y1, w, h = _region_to_pixels(ocr_region, TARGET_WIDTH, TARGET_HEIGHT)
-        blur_filter_str = (
-            f"split[base][forblur];"
-            f"[forblur]crop={w}:{h}:{x1}:{y1},boxblur={_compute_safe_blur_strength(w, h)}[blurred];"
-            f"[base][blurred]overlay={x1}:{y1}[withblur]"
-        )
-        margin_v = _compute_ocr_margin_v(TARGET_HEIGHT, ocr_region, trans_font_size)
-        rprint(f"[bold cyan]MarginV tính theo vùng crop: {margin_v}[/bold cyan]")
-        trans_srt_escaped = TRANS_SRT.replace("\\", "/").replace(":", "\\:")
         vf_chain = (
-            f"{blur_filter_str};"
-            f"[withblur]scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
-            f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-            f"subtitles={trans_srt_escaped}:original_size={TARGET_WIDTH}x{TARGET_HEIGHT}:"
-            f"force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'[final]"
+            f"[0:v]{base_video_vf}[scaled_vid];"
+            f"[scaled_vid]split[base][forblur];"
+            f"[forblur]crop={w}:{h}:{x1}:{y1},boxblur={_compute_safe_blur_strength(w, h)}[blurred];"
+            f"[base][blurred]overlay={x1}:{y1}[withblur];"
+            f"[withblur][1:v]overlay=0:0[final]"
         )
-        ffmpeg_cmd = [
-            'ffmpeg', '-i', video_file,
-            '-filter_complex', vf_chain.encode('utf-8'),
-            '-map', '[final]', '-map', '0:a?',
-        ]
     else:
-        margin_v = compute_sub_margin_v(TARGET_HEIGHT)
-        trans_srt_escaped = TRANS_SRT.replace("\\", "/").replace(":", "\\:")
-        ffmpeg_cmd = [
-            'ffmpeg', '-i', video_file,
-            '-vf', (
-                f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={TARGET_WIDTH}:{TARGET_HEIGHT}:(ow-iw)/2:(oh-ih)/2,"
-                f"subtitles={trans_srt_escaped}:force_style='{subtitles_style},Alignment=2,MarginV={margin_v}'"
-            ).encode('utf-8'),
-        ]
+        vf_chain = (
+            f"[0:v]{base_video_vf}[scaled_vid];"
+            f"[scaled_vid][1:v]overlay=0:0[final]"
+        )
+
+    ffmpeg_cmd = [
+        'ffmpeg', '-i', video_file,
+        '-f', 'concat', '-safe', '0', '-i', CONCAT_TXT,
+        '-filter_complex', vf_chain,
+        '-map', '[final]', '-map', '0:a?'
+    ]
 
     ffmpeg_gpu = load_key("ffmpeg_gpu")
     if ffmpeg_gpu:
-        rprint("[bold green]will use GPU acceleration.[/bold green]")
         ffmpeg_cmd.extend(['-c:v', 'h264_nvenc'])
     else:
-        # limit ffmpeg thread count
         ffmpeg_threads = load_key("ffmpeg_threads")
         if ffmpeg_threads and ffmpeg_threads > 0:
             ffmpeg_cmd.extend(['-threads', str(ffmpeg_threads)])
+
     ffmpeg_cmd.extend(['-y', OUTPUT_VIDEO])
 
-    rprint("🎬 Start merging subtitles to video...")
+    rprint("🎬 Start overlaying PNG sequence to video...")
     start_time = time.time()
     process = subprocess.Popen(ffmpeg_cmd)
 
     try:
         process.wait()
         if process.returncode == 0:
-            rprint(f"\n✅ Done! Time taken: {time.time() - start_time:.2f} seconds")
+            rprint(f"\n✅ Done! Khung bo góc chuẩn CapCut. Time taken: {time.time() - start_time:.2f} seconds")
         else:
             rprint("\n❌ FFmpeg execution error")
     except Exception as e:

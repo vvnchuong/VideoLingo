@@ -1,9 +1,10 @@
 import json
 from core.utils import *
 
+
 ## ================================================================
 # @ step4_splitbymeaning.py
-def get_split_prompt(sentence, num_parts = 2, word_limit = 20):
+def get_split_prompt(sentence, num_parts=2, word_limit=20):
     language = load_key("whisper.detected_language")
     split_prompt = f"""
 ## Role
@@ -43,17 +44,83 @@ Note: Start you answer with ```json and end with ```, do not add any other text.
 """.strip()
     return split_prompt
 
+
+## ================================================================
+# @ step4_splitbymeaning.py - BATCH version
+# Gộp nhiều câu cần split vào 1 lần gọi ask_gpt duy nhất, thay vì gọi riêng
+# cho từng câu - giảm số request tới LLM khi nhiều câu cần tách cùng lúc.
+def get_split_prompt_batch(items):
+    """items: list of dict {index, sentence, num_parts, word_limit}."""
+    language = load_key("whisper.detected_language")
+
+    items_block_parts = []
+    output_schema_parts = []
+    for item in items:
+        idx = item["index"]
+        items_block_parts.append(
+            f'''Line {idx} (split into {item["num_parts"]} parts, each < {item["word_limit"]} words):
+<split_this_sentence>
+{item["sentence"]}
+</split_this_sentence>'''
+        )
+        output_schema_parts.append(f'''
+    "{idx}": {{
+        "analysis": "Brief description of sentence structure, complexity, and key splitting challenges for this line",
+        "split1": "First splitting approach with [br] tags at split positions",
+        "split2": "Alternative splitting approach with [br] tags at split positions",
+        "assess": "Comparison of both approaches highlighting their strengths and weaknesses",
+        "choice": "1 or 2"
+    }}''')
+
+    items_block = "\n\n".join(items_block_parts)
+    output_schema = ",".join(output_schema_parts)
+
+    split_prompt = f"""
+## Role
+You are a professional Netflix subtitle splitter in **{language}**.
+
+## Task
+Below are MULTIPLE independent lines, each needing to be split into a given number of parts (each under
+the given word limit). For EACH line (keyed by its number), do the following:
+
+1. Maintain sentence meaning coherence according to Netflix subtitle standards.
+2. MOST IMPORTANT: Keep parts roughly equal in length (minimum 3 words each).
+3. Split at natural points like punctuation marks or conjunctions.
+4. If the line's text is repeated words, simply split at the middle of the repeated words.
+5. Treat each line completely independently - do not mix content between lines.
+
+## Steps (per line)
+1. Analyze the sentence structure, complexity, and key splitting challenges.
+2. Generate two alternative splitting approaches with [br] tags at split positions.
+3. Compare both approaches highlighting their strengths and weaknesses.
+4. Choose the best splitting approach.
+
+## Given Text (one block per line, in order)
+{items_block}
+
+## Output — JSON object keyed by line number, containing ALL lines above, no other text:
+```json
+{{{output_schema}
+}}
+```
+
+Note: Start you answer with ```json and end with ```, do not add any other text.
+""".strip()
+    return split_prompt
+
+
 """{{
     "analysis": "Brief analysis of the text structure",
     "split": "Complete sentence with [br] tags at split positions"
 }}"""
+
 
 ## ================================================================
 # @ step4_1_summarize.py
 def get_summary_prompt(source_content, custom_terms_json=None):
     src_lang = load_key("whisper.detected_language")
     tgt_lang = load_key("target_language")
-    
+
     # add custom terms note
     terms_note = ""
     if custom_terms_json:
@@ -61,7 +128,7 @@ def get_summary_prompt(source_content, custom_terms_json=None):
         for term in custom_terms_json['terms']:
             terms_list.append(f"- {term['src']}: {term['tgt']} ({term['note']})")
         terms_note = "\n### Existing Terms\nPlease exclude these terms in your extraction:\n" + "\n".join(terms_list)
-    
+
     summary_prompt = f"""
 ## Role
 You are a video translation expert and terminology consultant, specializing in {src_lang} comprehension and {tgt_lang} expression optimization.
@@ -123,6 +190,7 @@ Note: Start you answer with ```json and end with ```, do not add any other text.
 """.strip()
     return summary_prompt
 
+
 ## ================================================================
 # @ step5_translate.py & translate_lines.py
 def generate_shared_prompt(previous_content_prompt, after_content_prompt, summary_prompt, things_to_note_prompt):
@@ -141,11 +209,12 @@ def generate_shared_prompt(previous_content_prompt, after_content_prompt, summar
 ### Points to Note
 {things_to_note_prompt}'''
 
+
 def get_prompt_faithfulness(lines, shared_prompt):
     TARGET_LANGUAGE = load_key("target_language")
     # Split lines by \n
     line_splits = lines.split('\n')
-    
+
     json_dict = {}
     for i, line in enumerate(line_splits, 1):
         json_dict[f"{i}"] = {"origin": line, "direct": f"direct {TARGET_LANGUAGE} translation {i}."}
@@ -231,7 +300,7 @@ Please use a two-step thinking process to handle the text line by line:
    - Ensure it's easy for {TARGET_LANGUAGE} audience to understand and accept
    - Adapt the language style to match the theme (e.g., use casual language for tutorials, professional terminology for technical content, formal language for documentaries)
 </Translation Analysis Steps>
-   
+
 ## INPUT
 <subtitles>
 {lines}
@@ -258,8 +327,8 @@ def get_align_prompt(src_sub, tr_sub, src_part):
     align_parts_json = ','.join(
         f'''
         {{
-            "src_part_{i+1}": "{src_splits[i]}",
-            "target_part_{i+1}": "Corresponding aligned {targ_lang} subtitle part"
+            "src_part_{i + 1}": "{src_splits[i]}",
+            "target_part_{i + 1}": "Corresponding aligned {targ_lang} subtitle part"
         }}''' for i in range(num_parts)
     )
 
@@ -297,10 +366,84 @@ Note: Start you answer with ```json and end with ```, do not add any other text.
 '''.strip()
     return align_prompt
 
+
+## ================================================================
+# @ step6_splitforsub.py - BATCH version
+# Gộp nhiều dòng cần align vào 1 prompt duy nhất thay vì gọi ask_gpt riêng
+# cho từng dòng - giảm số request tới LLM, đặc biệt quan trọng khi video dài
+# (nhiều dòng cần split) và cần tránh vượt rate limit (RPM) của provider.
+def get_align_prompt_batch(items):
+    """items: list of dict {index, src_sub, tr_sub, src_part (đã có [br])}
+    Mỗi item có thể có SỐ PHẦN split khác nhau (2, 3...), nên JSON schema
+    cho từng item được build riêng theo đúng num_parts của item đó."""
+    targ_lang = load_key("target_language")
+    src_lang = load_key("whisper.detected_language")
+
+    items_block_parts = []
+    output_schema_parts = []
+    for item in items:
+        idx = item["index"]
+        src_splits = item["src_part"].split('\n')
+        num_parts = len(src_splits)
+        src_part_display = item["src_part"].replace('\n', ' [br] ')
+
+        items_block_parts.append(
+            f'''Line {idx}:
+{src_lang} Original: "{item["src_sub"]}"
+{targ_lang} Original: "{item["tr_sub"]}"
+Pre-processed {src_lang} Subtitles ([br] indicates split points): {src_part_display}'''
+        )
+
+        align_parts_json = ','.join(
+            f'''
+            {{
+                "src_part_{i + 1}": "{src_splits[i]}",
+                "target_part_{i + 1}": "Corresponding aligned {targ_lang} subtitle part"
+            }}''' for i in range(num_parts)
+        )
+        output_schema_parts.append(f'''
+    "{idx}": {{
+        "analysis": "Brief analysis of word order, structure, and semantic correspondence for this line",
+        "align": [{align_parts_json}
+        ]
+    }}''')
+
+    items_block = "\n\n".join(items_block_parts)
+    output_schema = ",".join(output_schema_parts)
+
+    align_prompt = f'''
+## Role
+You are a Netflix subtitle alignment expert fluent in both {src_lang} and {targ_lang}.
+
+## Task
+Below are MULTIPLE independent lines, each with {src_lang} and {targ_lang} original subtitles for a
+Netflix program, as well as a pre-processed split version of the {src_lang} subtitle for that line.
+For EACH line (keyed by its number), create the best splitting scheme for the {targ_lang} subtitle.
+
+1. Treat each line completely independently - do not mix content between lines.
+2. Analyze the word order and structural correspondence between {src_lang} and {targ_lang} for that line.
+3. Split the {targ_lang} subtitle according to the pre-processed {src_lang} split version of that line.
+4. Never leave empty lines. If it's difficult to split based on meaning, you may appropriately rewrite the
+   sentence that needs to be aligned.
+5. Do not add comments or explanations in the translation, as the subtitles are for the audience to read.
+
+## INPUT (one block per line, in timeline order)
+{items_block}
+
+## Output — JSON object keyed by line number, containing ALL lines above, no other text:
+```json
+{{{output_schema}
+}}
+```
+
+Note: Start you answer with ```json and end with ```, do not add any other text.
+'''.strip()
+    return align_prompt
+
+
 ## ================================================================
 # @ step8_gen_audio_task.py @ step10_gen_audio.py
 def get_subtitle_trim_prompt(text, duration):
- 
     rule = '''Consider a. Reducing filler words without modifying meaningful content. b. Omitting unnecessary modifiers or pronouns, for example:
     - "Please explain your thought process" can be shortened to "Please explain thought process"
     - "We need to carefully analyze this complex problem" can be shortened to "We need to analyze this problem"
@@ -337,6 +480,7 @@ Please follow these steps and provide the results in the JSON output:
 Note: Start you answer with ```json and end with ```, do not add any other text.
 '''.strip()
     return trim_prompt
+
 
 ## ================================================================
 # @ tts_main

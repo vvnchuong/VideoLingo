@@ -326,16 +326,15 @@ def _build_text_steps():
     #     của zh_pipeline thay vì pipeline gốc VideoLingo (WhisperX).
     #   - OCR (không cần biết ngôn ngữ gốc, chỉ đọc hardsub có sẵn) lại bị
     #     RÀNG BUỘC vào sourceLang=="zh" mới chạy được, dù OCR tiếng Anh/khác
-    #     cũng cần đúng logic đọc hardsub + review 4-pass Gemini y hệt.
+    #     cũng cần đúng logic đọc hardsub + dịch y hệt.
     # Giờ: Whisper (mọi ngôn ngữ, kể cả zh) -> luôn pipeline gốc. OCR (bất kỳ
-    # ngôn ngữ) -> vẫn dùng zh_pipeline (nhánh OCR bên trong đã tự bỏ qua VAD,
-    # chỉ còn review 4-pass Gemini - xem zh_pipeline.zh_asr_and_translate).
+    # ngôn ngữ) -> dùng core/ocr_lines.py (xem ocr_lines.src_asr_and_translate).
     subtitle_source = _get_subtitle_source()
 
     if subtitle_source == "ocr":
-        from core.zh_pipeline import zh_asr_and_translate
+        from core.ocr_lines import src_asr_and_translate
         return [
-            ("OCR hardsub + Gemini duration-aware translate", zh_asr_and_translate),
+            ("OCR hardsub + LLM duration-aware translate", src_asr_and_translate),
             ("Merging subtitles into the video", _7_sub_into_vid.merge_subtitles_to_video),
         ]
 
@@ -361,9 +360,9 @@ def _build_audio_steps():
     subtitle_source = _get_subtitle_source()
 
     if subtitle_source == "ocr":
-        from core.zh_pipeline import zh_gen_audio_tasks
+        from core.ocr_lines import src_gen_audio_tasks
         return [
-            ("Generate audio tasks and chunks", lambda: zh_gen_audio_tasks()),
+            ("Generate audio tasks and chunks", lambda: src_gen_audio_tasks()),
             ("Extract reference audio", _9_refer_audio.extract_refer_audio_main),
             ("Generate and merge audio files", _10_gen_audio.gen_audio),
             ("Merge full audio", _11_merge_audio.merge_full_audio),
@@ -440,6 +439,15 @@ def main():
         "--ocr-right", default="", help="Toạ độ right vùng quét/che (tỉ lệ 0.0-1.0)."
     )
     parser.add_argument(
+        "--subtitle-position-top", default="",
+        help="Toạ độ top vị trí burn sub cho nguồn Whisper (tỉ lệ 0.0-1.0, xem "
+             "SubtitlePositionPicker.jsx), rỗng nếu không tự chọn (dùng vị trí mặc định)."
+    )
+    parser.add_argument(
+        "--subtitle-position-bottom", default="",
+        help="Toạ độ bottom vị trí burn sub cho nguồn Whisper (tỉ lệ 0.0-1.0)."
+    )
+    parser.add_argument(
         "--background-music-volume", default="",
         help="Âm lượng nhạc nền gốc khi mix với giọng dub, 0.0-1.0 (VD: 0 = xoá "
              "hoàn toàn, 0.05 = giữ 5%%, 1.0 = giữ nguyên) - chỉ áp dụng cho stage "
@@ -447,13 +455,22 @@ def main():
              "thì dùng giá trị đang có sẵn trong config.yaml (keep_background_music/"
              "background_music_volume)."
     )
+    parser.add_argument(
+        "--subtitle-style", default="",
+        help="yellow_black | white_black | black_opaque_white - áp dụng cho CẢ "
+             "stage dub lẫn sub-only (xem core/subtitle_style_presets.py). Rỗng "
+             "thì dùng giá trị đang có sẵn trong config.yaml (subtitle_style)."
+    )
     args = parser.parse_args()
 
     print(
         f"[DEBUG] source_lang='{args.source_lang}' subtitle_source='{args.subtitle_source}' "
         f"voice_id='{args.voice_id}' ocr_top='{args.ocr_top}' ocr_bottom='{args.ocr_bottom}' "
         f"ocr_left='{args.ocr_left}' ocr_right='{args.ocr_right}' "
-        f"background_music_volume='{args.background_music_volume}' - rỗng nghĩa là Java "
+        f"subtitle_position_top='{args.subtitle_position_top}' "
+        f"subtitle_position_bottom='{args.subtitle_position_bottom}' "
+        f"background_music_volume='{args.background_music_volume}' "
+        f"subtitle_style='{args.subtitle_style}' - rỗng nghĩa là Java "
         f"KHÔNG gửi giá trị này, config.yaml sẽ giữ nguyên như cũ.",
         flush=True
     )
@@ -469,6 +486,9 @@ def main():
     if args.background_music_volume != "":
         update_key("background_music_volume", float(args.background_music_volume))
         print(f"[DEBUG] Đã ghi background_music_volume = {args.background_music_volume} vào config.yaml", flush=True)
+    if args.subtitle_style:
+        update_key("subtitle_style", args.subtitle_style)
+        print(f"[DEBUG] Đã ghi subtitle_style = {args.subtitle_style} vào config.yaml", flush=True)
 
     if args.ocr_top and args.ocr_bottom and args.ocr_left and args.ocr_right:
         ocr_region = {
@@ -486,6 +506,26 @@ def main():
             "[CẢNH BÁO] config.yaml chưa có sẵn key 'ocr_region' nên update_key() không ghi được gì "
             "(update_key chỉ SỬA key đã tồn tại, không tự tạo key mới) - cần thêm dòng "
             "'ocr_region: null' vào config.yaml 1 lần cho đủ key.",
+            flush=True
+        )
+
+    # Vị trí burn sub cho nguồn Whisper (SubtitlePositionPicker.jsx) - không có
+    # left/right vì thanh chọn chỉ kéo dọc. Cùng cơ chế update_key() như ocr_region:
+    # chỉ SỬA key đã tồn tại, không tự tạo mới.
+    if args.subtitle_position_top and args.subtitle_position_bottom:
+        subtitle_position = {
+            "top": float(args.subtitle_position_top),
+            "bottom": float(args.subtitle_position_bottom),
+        }
+    else:
+        subtitle_position = None
+
+    ok = update_key("subtitle_position", subtitle_position)
+    if not ok:
+        print(
+            "[CẢNH BÁO] config.yaml chưa có sẵn key 'subtitle_position' nên update_key() không ghi được gì "
+            "(update_key chỉ SỬA key đã tồn tại, không tự tạo key mới) - cần thêm dòng "
+            "'subtitle_position: null' vào config.yaml 1 lần cho đủ key.",
             flush=True
         )
 
@@ -554,7 +594,6 @@ def _finalize_sub_only_result(output_path: str):
     if not os.path.exists(SUB_VIDEO):
         raise RuntimeError(f"Pipeline chạy xong nhưng không thấy file kết quả tại {SUB_VIDEO}")
 
-    # Cùng lý do như _finalize_result ở trên.
     sub_video_abs = os.path.abspath(SUB_VIDEO)
     output_path_abs = os.path.abspath(output_path)
     if sub_video_abs != output_path_abs:

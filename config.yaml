@@ -2,21 +2,16 @@
 
 display_language: "en"
 
-# API settings
 api:
   key: 'YOUR_GEMINI_API_KEY'
   keys:
   - 'YOUR_GEMINI_API_KEY_1'
   - 'YOUR_GEMINI_API_KEY_2'
   - 'YOUR_GEMINI_API_KEY_3'
-#  key: 'YOUR_GROQ_API_KEY'
   base_url: 'https://generativelanguage.googleapis.com/v1beta/openai'
-#  base_url: 'https://api.groq.com/openai/v1'
   model: 'gemini-3.1-flash-lite'
-#  model: 'qwen/qwen3-32b'
-#  model: 'meta-llama/llama-4-scout-17b-16e-instruct'
   llm_support_json: true
-max_workers: 2
+max_workers: 4
 
 target_language: 'Tiếng Việt'
 subtitle_source: 'whisper'
@@ -29,24 +24,26 @@ ocr_region:
   left: 0.073258529834533
   right: 0.913258529834533
 whisper:
-  model: 'medium'
+  model: 'large-v3'
   language: 'zh'
   detected_language: 'zh'
   runtime: 'local'
-  whisperX_302_api_key: ''
-  elevenlabs_api_key: ''
+  whisperX_302_api_key: 'YOUR_WHISPERX_API_KEY'
+  elevenlabs_api_key: 'YOUR_ELEVENLABS_API_KEY'
 
 burn_subtitles: true
 
 ## ======================== Advanced Settings ======================== ##
 
 ffmpeg_gpu: true
-# Limit FFmpeg thread count
 ffmpeg_threads: 4
-# (24GB -> 20000, 16GB -> ~13000, ...).
 vram_threshold_mb: 4000
 
 background_music_volume: 1.0
+
+subtitle_style: white_black
+
+subtitle_position: null
 
 youtube:
   cookies_path: ''
@@ -61,33 +58,34 @@ summary_length: 8000
 max_split_length: 20
 reflect_translate: true
 pause_before_translate: false
+split_align_batch_size: 150
 
 ## ======================== Dubbing Settings ========================  ##
-#qwen/qwen3-32b
+
 tts_method: 'custom_tts'
 
 sf_fish_tts:
-  api_key: ''
+  api_key: 'YOUR_FISH_TTS_API_KEY'
   voice: 'anna'
   custom_name: ''
   voice_id: ''
   mode: "preset"
 
 openai_tts:
-  api_key: ''
+  api_key: 'YOUR_OPENAI_API_KEY'
   voice: 'alloy'
 
 azure_tts:
-  api_key: ''
+  api_key: 'YOUR_AZURE_API_KEY'
   voice: 'vi-VN-HoaiMyNeural'
 
 fish_tts:
-  api_key: ''
+  api_key: 'YOUR_FISH_TTS_API_KEY'
   character: ''
   character_id_dict: {}
 
 sf_cosyvoice2:
-  api_key: ''
+  api_key: 'YOUR_COSYVOICE_API_KEY'
 
 edge_tts:
   voice: 'vi-VN-HoaiMyNeural'
@@ -97,7 +95,7 @@ gpt_sovits:
   refer_mode: 3
 
 f5tts:
-  302_api: ''
+  302_api: 'YOUR_302_API_KEY'
 
 speed_factor:
   min: 1
@@ -110,8 +108,7 @@ tolerance: 1.5
 
 ## ======================== Additional settings ======================== ##
 
-#model_dir: './_model_cache'
-model_dir: 'YOUR_LOCAL_MODEL_DIR_PATH'
+model_dir: 'D:/project/pyhon/VideoLingo/_model_cache'
 allowed_video_formats:
 - 'mp4'
 - 'mov'
@@ -154,24 +151,14 @@ language_split_without_space:
 vieneu:
   mode: "v3turbo"
   voice: "Trúc Ly"
-  hf_home: "YOUR_LOCAL_HF_HOME_PATH"
+  hf_home: "D:/hf_cache"
 
-## ======================== ZH Pipeline ======================== ##
+## ======================== OCR Lines (core/ocr_lines.py) ======================== ##
 translate_max_sentences_per_chunk: 150
 translate_chunk_size_chars: 999999
-zh_pipeline:
-  gemini_api_key: 'YOUR_GEMINI_API_KEY_1, YOUR_GEMINI_API_KEY_2'
-  gemini_model: 'gemini-3.1-flash-lite'
-  translate_engine: 'pipeline_goc'
+src_pipeline:
   pipeline_goc_chunk_size: 150
-  whisper_model_zh: 'medium'
-  demucs_for_vad: true
-  demucs_model: 'htdemucs'
   portrait_font_size: 10
-  tts_split_max_chars: 42
   ocr_tts_split_max_chars: 200
-  no_speech_threshold: 0.95
   ocr_min_subtitle_duration: 0.8
   syllable_rate: 4.0
-  merge_min_zh_duration: 1.2
-  merge_max_zh_gap: 0.5

@@ -61,8 +61,11 @@ POLL_TIMEOUT_SECONDS = 30        # timeout tổng chờ 1 task xong
 # DEFAULT_DEVICE gốc (None) đã xác nhận bị block do dùng chung bởi mọi người
 # clone repo -> bỏ ra khỏi pool để đỡ tốn ~10s retry vô ích mỗi lần gọi.
 DEVICE_OVERRIDE_POOL: list[dict | None] = [
-    {"device_id": "7165910902483344908", "iid": "7019915595421604274", "tdid": "7165910902483344908"},
-    {"device_id": "7231884012345678901", "iid": "7231884098765432109", "tdid": "7231884098765432109"},
+    {"device_id": "7342995123456789012", "iid": "7342995198765432109", "tdid": "7342995123456789012"},
+    {"device_id": "7453006234567890123", "iid": "7453006298765432109", "tdid": "7453006234567890123"},
+    {"device_id": "7564117345678901234", "iid": "7564117398765432109", "tdid": "7564117345678901234"},
+    {"device_id": "7675228456789012345", "iid": "7675228498765432109", "tdid": "7675228456789012345"},
+    {"device_id": "7786339567890123456", "iid": "7786339598765432109", "tdid": "7786339567890123456"},
 ]
 
 # Pool riêng cho batch round-robin (synthesize_batch_fast).
